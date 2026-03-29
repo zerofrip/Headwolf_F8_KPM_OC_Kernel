@@ -1,10 +1,10 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v6.4) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (v6.5) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 - **CPU OPP reader** — exports CSRAM LUT data to userspace
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
-- **GPU overclocking** — patches the GPU default+working OPP tables in kernel memory at runtime
+- **GPU overclocking** — patches the GPU default + working OPP tables in kernel memory at runtime
 
 ## Hardware Details
 
@@ -128,10 +128,12 @@ cat /proc/gpufreqv2/gpu_working_opp_table | head -1
 ## Implementation Notes
 
 - **GKI compatibility**: `kallsyms_lookup_name` is resolved via kprobe (not directly exported in GKI 6.1)
-- **KCFI**: Functions calling kallsyms-resolved pointers are marked `__nocfi`
+- **No hard symbol dependencies**: `cpufreq_cpu_get` / `cpufreq_cpu_put` are resolved at runtime via `kallsyms_lookup_name` — the module has zero hard dependencies on the cpufreq subsystem, ensuring safe loading at any boot stage
+- **KCFI**: Functions calling kallsyms-resolved pointers are marked `__nocfi` (includes `set_cpu_oc`, `resolve_cpufreq_symbols`, GPU resolve/patch functions)
 - **GPU GPUEB mode**: `__gpufreq_get_working_table_gpu()` returns NULL when GPU is powered off; the module falls back to `gpufreq_get_working_table(0)` (wrapper public API) which reads `g_shared_status` — always CPU-accessible
 - **kthread safety**: After the 120 s poll loop, the kthread blocks on `kthread_should_stop()` to prevent UAF on `rmmod`
 - **CPU OC mechanism**: Writes new LUT entry (freq + volt, preserving gear-selector bits) to CSRAM, then updates `cpufreq_policy` freq_table max entry, `policy->max`, and `cpuinfo.max_freq` so the governor can target the new ceiling
+- **Boot-time OC**: When loaded with nonzero `cpu_oc_*_freq` params (e.g. from APatch service.sh), CPU OC is auto-applied during `kpm_oc_init`
 
 ## License
 
