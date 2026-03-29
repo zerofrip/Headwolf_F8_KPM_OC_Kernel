@@ -169,6 +169,54 @@ static int apply_dummy;
 module_param_cb(apply, &apply_ops, &apply_dummy, 0220);
 MODULE_PARM_DESC(apply, "Write 1 to scan CSRAM and export CPU OPP table");
 
+/* ─── kallsyms utility (shared by CPU OC + GPU OC) ─────────────────────── */
+typedef unsigned long (*kln_t)(const char *name);
+static kln_t kln_func;
+
+static int resolve_kallsyms(void)
+{
+	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+	int ret;
+
+	if (kln_func)
+		return 0;
+
+	ret = register_kprobe(&kp);
+	if (ret < 0) {
+		pr_err("KPM_OC: kprobe register failed: %d\n", ret);
+		return ret;
+	}
+	kln_func = (kln_t)kp.addr;
+	unregister_kprobe(&kp);
+
+	if (!kln_func) {
+		pr_err("KPM_OC: kallsyms_lookup_name not found\n");
+		return -ENOENT;
+	}
+	return 0;
+}
+
+/* cpufreq function pointers — resolved at runtime via kallsyms to avoid
+ * hard symbol dependencies that can prevent module loading at early boot.
+ */
+typedef struct cpufreq_policy *(*cpufreq_cpu_get_t)(unsigned int cpu);
+typedef void (*cpufreq_cpu_put_t)(struct cpufreq_policy *policy);
+
+static cpufreq_cpu_get_t fn_cpufreq_cpu_get;
+static cpufreq_cpu_put_t fn_cpufreq_cpu_put;
+
+static void __nocfi resolve_cpufreq_symbols(void)
+{
+	if (!kln_func)
+		return;
+	if (!fn_cpufreq_cpu_get)
+		fn_cpufreq_cpu_get =
+			(cpufreq_cpu_get_t)kln_func("cpufreq_cpu_get");
+	if (!fn_cpufreq_cpu_put)
+		fn_cpufreq_cpu_put =
+			(cpufreq_cpu_put_t)kln_func("cpufreq_cpu_put");
+}
+
 /* ─── CPU OC via CSRAM LUT[0] patch + cpufreq policy update ─────────────── */
 /*
  * For each cluster (L/B/P), if cpu_oc_X_freq is set to a nonzero value:
@@ -208,7 +256,7 @@ static char cpu_oc_result[CPU_RESULT_BUF_SIZE];
 module_param_string(cpu_oc_result, cpu_oc_result, sizeof(cpu_oc_result), 0444);
 MODULE_PARM_DESC(cpu_oc_result, "Result of last CPU OC patch (read-only)");
 
-static int set_cpu_oc(const char *val, const struct kernel_param *kp)
+static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 {
 	/* Indexed by cluster order: L=0, B=1, P=2 (matches cluster_policies[]) */
 	static unsigned int * const tgt_freqs[] = {
@@ -223,6 +271,10 @@ static int set_cpu_oc(const char *val, const struct kernel_param *kp)
 		pr_err("KPM_OC: CSRAM not mapped\n");
 		return -ENOMEM;
 	}
+
+	/* Resolve cpufreq functions lazily via kallsyms */
+	if (!resolve_kallsyms())
+		resolve_cpufreq_symbols();
 
 	mutex_lock(&lock);
 	memset(cpu_oc_result, 0, sizeof(cpu_oc_result));
@@ -286,8 +338,8 @@ static int set_cpu_oc(const char *val, const struct kernel_param *kp)
 
 		/* ── Update cpufreq policy so governor can target new max freq ── */
 		{
-			struct cpufreq_policy *policy =
-				cpufreq_cpu_get(cluster_policies[c]);
+			struct cpufreq_policy *policy = fn_cpufreq_cpu_get ?
+				fn_cpufreq_cpu_get(cluster_policies[c]) : NULL;
 			if (policy) {
 				struct cpufreq_frequency_table *tbl = policy->freq_table;
 				if (tbl) {
@@ -305,7 +357,8 @@ static int set_cpu_oc(const char *val, const struct kernel_param *kp)
 				}
 				policy->max                 = target_khz;
 				policy->cpuinfo.max_freq    = target_khz;
-				cpufreq_cpu_put(policy);
+				if (fn_cpufreq_cpu_put)
+					fn_cpufreq_cpu_put(policy);
 				pr_info("KPM_OC: CPU %s cpufreq policy->max updated to %uKHz\n",
 					cluster_names[c], target_khz);
 			}
@@ -362,33 +415,6 @@ MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram for OPP[0] in µV (default 
 static char gpu_oc_result[GPU_RESULT_BUF_SIZE];
 module_param_string(gpu_oc_result, gpu_oc_result, sizeof(gpu_oc_result), 0444);
 MODULE_PARM_DESC(gpu_oc_result, "Result of last GPU OC patch operation");
-
-/* kallsyms_lookup_name via kprobes (GKI 6.1 compatible) */
-typedef unsigned long (*kln_t)(const char *name);
-static kln_t kln_func;
-
-static int resolve_kallsyms(void)
-{
-	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
-	int ret;
-
-	if (kln_func)
-		return 0;
-
-	ret = register_kprobe(&kp);
-	if (ret < 0) {
-		pr_err("KPM_OC: kprobe register failed: %d\n", ret);
-		return ret;
-	}
-	kln_func = (kln_t)kp.addr;
-	unregister_kprobe(&kp);
-
-	if (!kln_func) {
-		pr_err("KPM_OC: kallsyms_lookup_name not found\n");
-		return -ENOENT;
-	}
-	return 0;
-}
 
 /*
  * Runtime patch strategy:
@@ -698,7 +724,7 @@ static int __init kpm_oc_init(void)
 	}
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + GPU OC v6.3 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.5 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Auto-scan CPU OPP on load */
@@ -745,4 +771,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.4");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.5");
