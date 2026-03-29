@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * KPM OC Module for MediaTek MT8792 (Dimensity 8300)
- * Reads CPU DVFS LUT from performance-controller CSRAM domains.
- * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
- * GPU data is read from userspace via /proc/gpufreqv2.
+ * - Reads CPU DVFS LUT from performance-controller CSRAM domains.
+ * - GPU OPP runtime memory patcher (default + working + shared_status).
+ *   v6.0: kthread delayed patch — retries until GPU probe completes.
  *
+ * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
  */
 #include <linux/module.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
+#include <linux/kprobes.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/string.h>
 
 /* ─── CSRAM Configuration ───────────────────────────────────────────────── */
 /*
@@ -162,6 +167,365 @@ static int apply_dummy;
 module_param_cb(apply, &apply_ops, &apply_dummy, 0220);
 MODULE_PARM_DESC(apply, "Write 1 to scan CSRAM and export CPU OPP table");
 
+/* ─── GPU OPP Runtime Memory Patcher ────────────────────────────────────── */
+/*
+ * Patches g_gpu_default_opp_table[0] in the already-loaded mtk_gpufreq_mt6897
+ * module's kernel memory, then updates the shared-status region so GPUEB can
+ * (potentially) see the new values.
+ *
+ * OPP entry layout (stride 24 bytes):
+ *   u32 freq;     // KHz
+ *   u32 volt;     // µV
+ *   u32 vsram;    // µV
+ *   u32 posdiv;
+ *   u32 vaging;
+ *   u32 power;
+ */
+
+#define GPU_OPP_STRIDE       24
+#define GPU_OPP_SHARED_OFF   0x3ec   /* GPU OPP table offset in shared_status */
+#define GPU_RESULT_BUF_SIZE  512
+
+/* Configurable via module params */
+static unsigned int gpu_target_freq = 1450000;
+module_param(gpu_target_freq, uint, 0644);
+MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq for OPP[0] in KHz (default 1450000)");
+
+static unsigned int gpu_target_volt = 87500;
+module_param(gpu_target_volt, uint, 0644);
+MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt for OPP[0] in µV (default 87500)");
+
+static unsigned int gpu_target_vsram = 87500;
+module_param(gpu_target_vsram, uint, 0644);
+MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram for OPP[0] in µV (default 87500)");
+
+static char gpu_oc_result[GPU_RESULT_BUF_SIZE];
+module_param_string(gpu_oc_result, gpu_oc_result, sizeof(gpu_oc_result), 0444);
+MODULE_PARM_DESC(gpu_oc_result, "Result of last GPU OC patch operation");
+
+/* kallsyms_lookup_name via kprobes (GKI 6.1 compatible) */
+typedef unsigned long (*kln_t)(const char *name);
+static kln_t kln_func;
+
+static int resolve_kallsyms(void)
+{
+	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+	int ret;
+
+	if (kln_func)
+		return 0;
+
+	ret = register_kprobe(&kp);
+	if (ret < 0) {
+		pr_err("KPM_OC: kprobe register failed: %d\n", ret);
+		return ret;
+	}
+	kln_func = (kln_t)kp.addr;
+	unregister_kprobe(&kp);
+
+	if (!kln_func) {
+		pr_err("KPM_OC: kallsyms_lookup_name not found\n");
+		return -ENOENT;
+	}
+	return 0;
+}
+
+/*
+ * Runtime patch strategy:
+ * 1) Patch g_gpu_default_opp_table[0] via direct symbol lookup.
+ * 2) Patch runtime tables via getter functions:
+ *      __gpufreq_get_working_table_gpu()
+ *      __gpufreq_get_signed_table_gpu()
+ * 3) Best-effort sync to shared_status by calling:
+ *      __gpufreq_update_shared_status_opp_table()
+ *
+ * This intentionally avoids fixed .bss deltas. On this target, duplicate local
+ * symbols (for example g_shared_status) can resolve to storage that stays NULL.
+ */
+typedef u32 *(*gpufreq_get_table_t)(void);
+typedef void (*gpufreq_update_shared_t)(void);
+/* gpufreq_get_working_table(target) from mtk_gpufreq_wrapper - public API.
+ * Takes an int (TARGET_GPU=0, TARGET_STACK=1). May read g_shared_status which
+ * is CPU-accessible even when GPU is powered off, unlike the internal variant.
+ */
+typedef u32 *(*gpufreq_get_table_tgt_t)(int target);
+
+/* Saved only for diagnostics; runtime patching no longer relies on this. */
+static unsigned long opp_table_anchor;
+static gpufreq_get_table_t fn_get_working_table_gpu;
+static gpufreq_get_table_t fn_get_signed_table_gpu;
+static gpufreq_get_table_tgt_t fn_get_working_table_wrap;
+static gpufreq_get_table_tgt_t fn_get_signed_table_wrap;
+static gpufreq_update_shared_t fn_update_shared_status_opp_table;
+
+/*
+ * Track availability/patch state. Bits:
+ *   1 = g_gpu_default_opp_table[0] patched
+ *   2 = working_table_gpu[0] patched
+ *   4 = signed_table_gpu[0] patched
+ *
+ * Note: set_gpu_oc() always rewrites OPP[0] so users can change
+ * gpu_target_* and re-apply at runtime.
+ */
+static int gpu_oc_patched;
+
+/* Kthread for delayed patch (polls until GPU probe completes) */
+static struct task_struct *gpu_oc_task;
+
+static void __nocfi gpu_resolve_runtime_symbols(void)
+{
+    if (!kln_func)
+        return;
+
+    if (!fn_get_working_table_gpu)
+        fn_get_working_table_gpu =
+            (gpufreq_get_table_t)kln_func("__gpufreq_get_working_table_gpu");
+
+    if (!fn_get_signed_table_gpu)
+        fn_get_signed_table_gpu =
+            (gpufreq_get_table_t)kln_func("__gpufreq_get_signed_table_gpu");
+
+    if (!fn_update_shared_status_opp_table)
+        fn_update_shared_status_opp_table =
+            (gpufreq_update_shared_t)kln_func("__gpufreq_update_shared_status_opp_table");
+
+    /* Public wrapper API - reads g_shared_status, accessible when GPU is off */
+    if (!fn_get_working_table_wrap)
+        fn_get_working_table_wrap =
+            (gpufreq_get_table_tgt_t)kln_func("gpufreq_get_working_table");
+    if (!fn_get_signed_table_wrap)
+        fn_get_signed_table_wrap =
+            (gpufreq_get_table_tgt_t)kln_func("gpufreq_get_signed_table");
+}
+
+static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
+{
+    u32 freq;
+
+    if (!tbl)
+        return 0;
+
+    freq = tbl[0];
+    if (freq < 1000000 || freq > 2000000) {
+        pr_warn("KPM_OC: %s[0] unexpected freq=%u, skip\n", name, freq);
+        return 0;
+    }
+
+    pr_info("KPM_OC: %s[0] at %px freq=%u -> %u\n",
+        name, tbl, freq, gpu_target_freq);
+    tbl[0] = gpu_target_freq;
+    tbl[1] = gpu_target_volt;
+    tbl[2] = gpu_target_vsram;
+    return bit;
+}
+
+/*
+ * gpu_oc_patch_wk_ss — attempt to patch working_table and signed_table.
+ * Caller MUST hold &lock.
+ * Returns bitmask of new patches (bits 2/4).
+ */
+static int __nocfi gpu_oc_patch_wk_ss(void)
+{
+	int patched = 0;
+	u32 *wt;
+	u32 *st = NULL;
+
+	gpu_resolve_runtime_symbols();
+
+	wt = NULL;
+	if (fn_get_working_table_gpu)
+		wt = fn_get_working_table_gpu();
+	/* Fallback: wrapper public API reads g_shared_status (GPU-off safe) */
+	if (!wt && fn_get_working_table_wrap)
+		wt = fn_get_working_table_wrap(0); /* TARGET_GPU = 0 */
+	patched |= gpu_patch_table_opp0(wt, "working_table", 2);
+
+	if (fn_get_signed_table_gpu)
+		st = fn_get_signed_table_gpu();
+	if (!st && fn_get_signed_table_wrap)
+		st = fn_get_signed_table_wrap(0);
+	patched |= gpu_patch_table_opp0(st, "signed_table", 4);
+
+	/* Sync shared_status so the proc file reflects the new frequency.
+	 * Only called when at least one table was patched (patched != 0),
+	 * to avoid NULL-deref when GPU is powered off.
+	 */
+	if (fn_update_shared_status_opp_table && patched)
+		fn_update_shared_status_opp_table();
+
+	if (patched)
+		wmb();
+
+	return patched;
+}
+
+/*
+ * Diagnostic dump: print resolved function pointers and current runtime tables.
+ */
+static void __nocfi gpu_oc_diagnostic(void)
+{
+	u32 *wt = NULL;
+	u32 *st = NULL;
+
+	gpu_resolve_runtime_symbols();
+
+	pr_info("KPM_OC: diag: opp_table_anchor=%px\n", (void *)opp_table_anchor);
+	pr_info("KPM_OC: diag: fn_get_wt=%px fn_get_st=%px fn_sync_ss=%px fn_wt_wrap=%px\n",
+		fn_get_working_table_gpu,
+		fn_get_signed_table_gpu,
+		fn_update_shared_status_opp_table,
+		fn_get_working_table_wrap);
+
+	if (fn_get_working_table_gpu)
+		wt = fn_get_working_table_gpu();
+	if (!wt && fn_get_working_table_wrap)
+		wt = fn_get_working_table_wrap(0);
+	if (fn_get_signed_table_gpu)
+		st = fn_get_signed_table_gpu();
+	if (!st && fn_get_signed_table_wrap)
+		st = fn_get_signed_table_wrap(0);
+
+	pr_info("KPM_OC: diag: working_table=%px signed_table=%px\n", wt, st);
+
+	if (wt) {
+		pr_info("KPM_OC: diag: working_table[0] freq=%u volt=%u vsram=%u\n",
+			wt[0], wt[1], wt[2]);
+	}
+
+	if (st) {
+		pr_info("KPM_OC: diag: signed_table[0] freq=%u volt=%u vsram=%u\n",
+			st[0], st[1], st[2]);
+	}
+}
+
+/*
+ * Kthread function: polls every 500 ms until working_table and shared_status
+ * are both patched, or until 120 seconds have elapsed.
+ */
+static int gpu_oc_kthread_fn(void *data)
+{
+	int tries = 0;
+	bool diag_done = false;
+
+	pr_info("KPM_OC: delayed-patch kthread started (max 120 s)\n");
+
+	while (!kthread_should_stop() && tries < 240) {
+		msleep(500);
+		tries++;
+
+		if ((gpu_oc_patched & 6) == 6)
+			break;
+
+		mutex_lock(&lock);
+		gpu_oc_patched |= gpu_oc_patch_wk_ss();
+		mutex_unlock(&lock);
+
+		/* After 35 s, dump diagnostics once if still not fully patched */
+		if (!diag_done && tries >= 70 && (gpu_oc_patched & 6) != 6) {
+			mutex_lock(&lock);
+			gpu_oc_diagnostic();
+			mutex_unlock(&lock);
+			diag_done = true;
+		}
+	}
+
+	if ((gpu_oc_patched & 6) == 6) {
+		pr_info("KPM_OC: kthread: GPU OC fully applied after %d*500ms (patched=%d)\n",
+			tries, gpu_oc_patched);
+		/* Update result string */
+		mutex_lock(&lock);
+		snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
+			 "OK:patched=%d,freq=%u,volt=%u,vsram=%u (kthread)",
+			 gpu_oc_patched, gpu_target_freq,
+			 gpu_target_volt, gpu_target_vsram);
+		mutex_unlock(&lock);
+	} else {
+		pr_warn("KPM_OC: kthread: timed out, patched=%d\n",
+			gpu_oc_patched);
+	}
+
+	/* Block until kthread_stop() is called from module exit.
+	 * Returning while gpu_oc_task is still set would cause
+	 * kthread_stop() to dereference a freed task_struct.
+	 */
+	while (!kthread_should_stop())
+		msleep(500);
+
+	return 0;
+}
+
+static int set_gpu_oc(const char *val, const struct kernel_param *kp)
+{
+	unsigned long opp_table_addr;
+	u32 *opp_entry;
+	u32 orig_freq, orig_volt, orig_vsram;
+	int pos = 0;
+	int newly_patched = 0;
+
+	mutex_lock(&lock);
+	memset(gpu_oc_result, 0, sizeof(gpu_oc_result));
+
+	if (resolve_kallsyms()) {
+		pos = snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
+			       "FAIL:kallsyms_resolve");
+		goto out;
+	}
+
+	gpu_resolve_runtime_symbols();
+
+	/* ── Step 1: Patch g_gpu_default_opp_table[0] (always re-apply) ── */
+	opp_table_addr = kln_func("g_gpu_default_opp_table");
+	if (!opp_table_addr) {
+		pos = snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
+			       "FAIL:opp_table_not_found");
+		goto out;
+	}
+
+	opp_entry = (u32 *)opp_table_addr;
+	orig_freq  = opp_entry[0];
+	orig_volt  = opp_entry[1];
+	orig_vsram = opp_entry[2];
+
+	if (orig_freq < 1000000 || orig_freq > 2000000) {
+		pos = snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
+			       "FAIL:unexpected_freq=%u", orig_freq);
+		goto out;
+	}
+
+	opp_entry[0] = gpu_target_freq;
+	opp_entry[1] = gpu_target_volt;
+	opp_entry[2] = gpu_target_vsram;
+	newly_patched |= 1;
+
+	pr_info("KPM_OC: default_opp[0]: freq=%u->%u volt=%u->%u vsram=%u->%u\n",
+		orig_freq, gpu_target_freq,
+		orig_volt, gpu_target_volt,
+		orig_vsram, gpu_target_vsram);
+
+	/* Save anchor for diagnostics */
+	if (!opp_table_anchor)
+		opp_table_anchor = opp_table_addr;
+
+	/* ── Steps 2-3: Patch runtime working/signed tables ── */
+	newly_patched |= gpu_oc_patch_wk_ss();
+
+	gpu_oc_patched |= newly_patched;
+	pos = snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
+		       "OK:patched=%d,freq=%u->%u,volt=%u->%u,vsram=%u->%u",
+		       gpu_oc_patched, orig_freq, gpu_target_freq,
+		       orig_volt, gpu_target_volt,
+		       orig_vsram, gpu_target_vsram);
+
+out:
+	mutex_unlock(&lock);
+	return 0;
+}
+
+static const struct kernel_param_ops gpu_oc_ops = { .set = set_gpu_oc };
+static int gpu_oc_dummy;
+module_param_cb(gpu_oc_apply, &gpu_oc_ops, &gpu_oc_dummy, 0220);
+MODULE_PARM_DESC(gpu_oc_apply, "Write 1 to patch GPU OPP[0] in kernel memory");
+
 /* ─── Module Init / Exit ────────────────────────────────────────────────── */
 
 static int __init kpm_oc_init(void)
@@ -174,17 +538,40 @@ static int __init kpm_oc_init(void)
 	}
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader v3.2 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + GPU OC v6.3 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
-	/* Auto-scan on load */
+	/* Auto-scan CPU OPP on load */
 	set_apply("1", NULL);
+
+	/* Auto-apply GPU OC: always patches default OPP; working+shared if already probed */
+	set_gpu_oc("1", NULL);
+
+	/*
+	 * If runtime tables are still unavailable (GPU probe not yet done),
+	 * start a kthread that polls until working+signed tables are patched.
+	 */
+	if ((gpu_oc_patched & 6) != 6) {
+		gpu_oc_task = kthread_run(gpu_oc_kthread_fn, NULL,
+					  "gpu_oc_worker");
+		if (IS_ERR(gpu_oc_task)) {
+			pr_warn("KPM_OC: kthread start failed: %ld\n",
+				PTR_ERR(gpu_oc_task));
+			gpu_oc_task = NULL;
+		} else {
+			pr_info("KPM_OC: delayed-patch kthread launched\n");
+		}
+	}
 
 	return 0;
 }
 
 static void __exit kpm_oc_exit(void)
 {
+	if (gpu_oc_task) {
+		kthread_stop(gpu_oc_task);
+		gpu_oc_task = NULL;
+	}
 	if (csram_base)
 		iounmap(csram_base);
 	pr_info("KPM_OC: Unloaded.\n");
@@ -194,4 +581,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader for KPM OC Manager v3.2");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + GPU OC patcher v6.3");
