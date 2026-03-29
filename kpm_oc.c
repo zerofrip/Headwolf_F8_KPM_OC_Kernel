@@ -2,8 +2,9 @@
 /*
  * KPM OC Module for MediaTek MT8792 (Dimensity 8300)
  * - Reads CPU DVFS LUT from performance-controller CSRAM domains.
- * - GPU OPP runtime memory patcher (default + working + shared_status).
- *   v6.0: kthread delayed patch — retries until GPU probe completes.
+ * - CPU OC: patches CSRAM LUT[0] per cluster + cpufreq policy max.
+ * - GPU OC: patches default + working + shared_status OPP tables.
+ *   v6.4: CPU OC support added.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -15,6 +16,7 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/string.h>
+#include <linux/cpufreq.h>
 
 /* ─── CSRAM Configuration ───────────────────────────────────────────────── */
 /*
@@ -166,6 +168,164 @@ static const struct kernel_param_ops apply_ops = { .set = set_apply };
 static int apply_dummy;
 module_param_cb(apply, &apply_ops, &apply_dummy, 0220);
 MODULE_PARM_DESC(apply, "Write 1 to scan CSRAM and export CPU OPP table");
+
+/* ─── CPU OC via CSRAM LUT[0] patch + cpufreq policy update ─────────────── */
+/*
+ * For each cluster (L/B/P), if cpu_oc_X_freq is set to a nonzero value:
+ *   1. Patches CSRAM LUT[0] (the hardware performance-controller table) with
+ *      the new freq (MHz) and volt (µV), keeping the original gear selector
+ *      bits [30:29]. Encoding: bits[11:0]=freq_MHz, bits[28:12]=volt_uv/10.
+ *   2. Updates the Linux cpufreq policy (freq_table max entry, policy->max,
+ *      cpuinfo.max_freq) so the governor can schedule the new maximum.
+ */
+#define CPU_RESULT_BUF_SIZE 512
+
+static unsigned int cpu_oc_l_freq;
+module_param(cpu_oc_l_freq, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_l_freq, "L cluster (policy0) OC target in KHz (0=disabled)");
+
+static unsigned int cpu_oc_l_volt;
+module_param(cpu_oc_l_volt, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_l_volt, "L cluster OC volt in µV (0=keep original)");
+
+static unsigned int cpu_oc_b_freq;
+module_param(cpu_oc_b_freq, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_b_freq, "B cluster (policy4) OC target in KHz (0=disabled)");
+
+static unsigned int cpu_oc_b_volt;
+module_param(cpu_oc_b_volt, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_b_volt, "B cluster OC volt in µV (0=keep original)");
+
+static unsigned int cpu_oc_p_freq;
+module_param(cpu_oc_p_freq, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_p_freq, "P cluster (policy7) OC target in KHz (0=disabled)");
+
+static unsigned int cpu_oc_p_volt;
+module_param(cpu_oc_p_volt, uint, 0644);
+MODULE_PARM_DESC(cpu_oc_p_volt, "P cluster OC volt in µV (0=keep original)");
+
+static char cpu_oc_result[CPU_RESULT_BUF_SIZE];
+module_param_string(cpu_oc_result, cpu_oc_result, sizeof(cpu_oc_result), 0444);
+MODULE_PARM_DESC(cpu_oc_result, "Result of last CPU OC patch (read-only)");
+
+static int set_cpu_oc(const char *val, const struct kernel_param *kp)
+{
+	/* Indexed by cluster order: L=0, B=1, P=2 (matches cluster_policies[]) */
+	static unsigned int * const tgt_freqs[] = {
+		&cpu_oc_l_freq, &cpu_oc_b_freq, &cpu_oc_p_freq
+	};
+	static unsigned int * const tgt_volts[] = {
+		&cpu_oc_l_volt, &cpu_oc_b_volt, &cpu_oc_p_volt
+	};
+	int c, pos = 0, any_patched = 0;
+
+	if (!csram_base) {
+		pr_err("KPM_OC: CSRAM not mapped\n");
+		return -ENOMEM;
+	}
+
+	mutex_lock(&lock);
+	memset(cpu_oc_result, 0, sizeof(cpu_oc_result));
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int target_khz = *tgt_freqs[c];
+		unsigned int target_uv  = *tgt_volts[c];
+		unsigned int dom_base   = domain_offsets[c];
+		u32 orig_lut, new_lut;
+		unsigned int orig_freq_mhz, orig_volt_uv, new_freq_mhz;
+
+		if (target_khz == 0)
+			continue;
+
+		/* Read current LUT[0] (highest OPP = index 0 in descending LUT) */
+		orig_lut      = readl_relaxed(csram_base + dom_base + REG_FREQ_LUT);
+		orig_freq_mhz = orig_lut & LUT_FREQ_MASK;
+		orig_volt_uv  = LUT_VOLT_DECODE(orig_lut);
+
+		if (orig_freq_mhz < 100 || orig_freq_mhz > 5000) {
+			pr_warn("KPM_OC: CPU %s LUT[0] unexpected freq=%u MHz\n",
+				cluster_names[c], orig_freq_mhz);
+			pos += snprintf(cpu_oc_result + pos, CPU_RESULT_BUF_SIZE - pos,
+					"%s=BAD_ORIG,", cluster_names[c]);
+			continue;
+		}
+
+		new_freq_mhz = target_khz / 1000;
+		if (new_freq_mhz > 5000) {
+			pr_warn("KPM_OC: CPU %s target %u MHz out of range\n",
+				cluster_names[c], new_freq_mhz);
+			pos += snprintf(cpu_oc_result + pos, CPU_RESULT_BUF_SIZE - pos,
+					"%s=OOB,", cluster_names[c]);
+			continue;
+		}
+
+		if (target_uv == 0)
+			target_uv = orig_volt_uv; /* keep original voltage */
+
+		/*
+		 * Encode new LUT entry:
+		 *   bits[30:29] = gear selector — keep from original
+		 *   bits[28:12] = volt_uv / 10
+		 *   bits[11:0]  = freq_MHz
+		 */
+		new_lut = (orig_lut & LUT_GEAR_MASK) |
+			  (new_freq_mhz & LUT_FREQ_MASK) |
+			  ((target_uv / 10) << 12);
+
+		writel_relaxed(new_lut, csram_base + dom_base + REG_FREQ_LUT);
+		wmb();
+
+		pr_info("KPM_OC: CPU %s LUT[0]: %uMHz@%uµV -> %uMHz@%uµV (0x%08x->0x%08x)\n",
+			cluster_names[c], orig_freq_mhz, orig_volt_uv,
+			new_freq_mhz, target_uv, orig_lut, new_lut);
+
+		pos += snprintf(cpu_oc_result + pos, CPU_RESULT_BUF_SIZE - pos,
+				"%s:%u->%uKHz@%uuV,",
+				cluster_names[c], orig_freq_mhz * 1000, target_khz, target_uv);
+		any_patched++;
+
+		/* ── Update cpufreq policy so governor can target new max freq ── */
+		{
+			struct cpufreq_policy *policy =
+				cpufreq_cpu_get(cluster_policies[c]);
+			if (policy) {
+				struct cpufreq_frequency_table *tbl = policy->freq_table;
+				if (tbl) {
+					int t, max_idx = 0;
+					unsigned int tbl_max = 0;
+
+					for (t = 0; tbl[t].frequency != CPUFREQ_TABLE_END; t++) {
+						if (tbl[t].frequency != CPUFREQ_ENTRY_INVALID &&
+						    tbl[t].frequency > tbl_max) {
+							tbl_max = tbl[t].frequency;
+							max_idx = t;
+						}
+					}
+					tbl[max_idx].frequency = target_khz;
+				}
+				policy->max                 = target_khz;
+				policy->cpuinfo.max_freq    = target_khz;
+				cpufreq_cpu_put(policy);
+				pr_info("KPM_OC: CPU %s cpufreq policy->max updated to %uKHz\n",
+					cluster_names[c], target_khz);
+			}
+		}
+	}
+
+	if (pos > 0 && cpu_oc_result[pos - 1] == ',')
+		cpu_oc_result[pos - 1] = '\0';
+	if (any_patched == 0 && pos == 0)
+		snprintf(cpu_oc_result, CPU_RESULT_BUF_SIZE,
+			 "NOOP:no cluster targets set");
+
+	mutex_unlock(&lock);
+	return 0;
+}
+
+static const struct kernel_param_ops cpu_oc_ops = { .set = set_cpu_oc };
+static int cpu_oc_dummy;
+module_param_cb(cpu_oc_apply, &cpu_oc_ops, &cpu_oc_dummy, 0220);
+MODULE_PARM_DESC(cpu_oc_apply, "Write 1 to patch CPU CSRAM LUT[0] + cpufreq policy max");
 
 /* ─── GPU OPP Runtime Memory Patcher ────────────────────────────────────── */
 /*
@@ -544,6 +704,10 @@ static int __init kpm_oc_init(void)
 	/* Auto-scan CPU OPP on load */
 	set_apply("1", NULL);
 
+	/* Auto-apply CPU OC if any cluster target is set */
+	if (cpu_oc_l_freq || cpu_oc_b_freq || cpu_oc_p_freq)
+		set_cpu_oc("1", NULL);
+
 	/* Auto-apply GPU OC: always patches default OPP; working+shared if already probed */
 	set_gpu_oc("1", NULL);
 
@@ -581,4 +745,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + GPU OC patcher v6.3");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.4");
