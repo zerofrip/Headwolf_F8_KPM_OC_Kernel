@@ -7,8 +7,9 @@
  *   v6.4: CPU OC support added.
  *   v6.6: Lift vendor freq_qos MAX constraints (powerhal, fpsgo, touch_boost)
  *         so scaling_max_freq can reach the OC'd frequency.
- *   v6.7: Periodic relift worker — vendor modules re-assert freq_qos MAX
- *         constraints, so a delayed_work keeps them lifted while OC is active.
+ *   v6.8: Relift reliability updates
+ *         - Start relift worker whenever any CPU OC target is set (even NOOP re-apply)
+ *         - Enforce policy max/cpuinfo max in worker and tighten relift interval.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -245,7 +246,7 @@ static unsigned long           pt_policy_list_sym; /* mtk_cpu_power_throttling l
 /* Periodic relift worker — re-lifts vendor freq_qos MAX constraints that
  * get re-asserted by powerhal, fpsgo, battery throttling, etc.
  */
-#define RELIFT_INTERVAL_MS 5000
+#define RELIFT_INTERVAL_MS 500
 static struct delayed_work cpu_oc_relift_dwork;
 static bool cpu_oc_relift_active;
 static unsigned int cpu_oc_targets[NUM_CLUSTERS]; /* per-cluster OC target KHz, 0=off */
@@ -325,7 +326,7 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 	static unsigned int * const tgt_volts[] = {
 		&cpu_oc_l_volt, &cpu_oc_b_volt, &cpu_oc_p_volt
 	};
-	int c, pos = 0, any_patched = 0;
+	int c, pos = 0, any_patched = 0, any_target = 0;
 
 	if (!csram_base) {
 		pr_err("KPM_OC: CSRAM not mapped\n");
@@ -513,10 +514,13 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 			 "NOOP:no cluster targets set");
 
 	/* Record per-cluster OC targets and start the periodic relift worker */
-	for (c = 0; c < NUM_CLUSTERS; c++)
+	for (c = 0; c < NUM_CLUSTERS; c++) {
 		cpu_oc_targets[c] = *tgt_freqs[c];
+		if (*tgt_freqs[c] > 0)
+			any_target = 1;
+	}
 
-	if (any_patched > 0 && !cpu_oc_relift_active) {
+	if (any_target && !cpu_oc_relift_active) {
 		cpu_oc_relift_active = true;
 		schedule_delayed_work(&cpu_oc_relift_dwork,
 				      msecs_to_jiffies(RELIFT_INTERVAL_MS));
@@ -551,6 +555,7 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 		unsigned int target = cpu_oc_targets[c];
 		struct cpufreq_policy *policy;
 		s32 agg_max;
+		bool need_enforce;
 
 		if (target == 0)
 			continue;
@@ -564,10 +569,17 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 			fn_freq_qos_read_value(&policy->constraints,
 					       2 /* FREQ_QOS_MAX */) : (s32)target;
 
-		if ((unsigned int)agg_max < target) {
+		need_enforce = ((unsigned int)agg_max < target) ||
+			      (policy->max < target) ||
+			      (policy->cpuinfo.max_freq < target);
+
+		if (need_enforce) {
 			/* Re-lift user request */
 			if (fn_freq_qos_update_req && policy->max_freq_req)
 				fn_freq_qos_update_req(policy->max_freq_req, target);
+
+			policy->max = target;
+			policy->cpuinfo.max_freq = target;
 
 			if (fn_cpufreq_cpu_put)
 				fn_cpufreq_cpu_put(policy);
@@ -959,7 +971,7 @@ static int __init kpm_oc_init(void)
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
 	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.7 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.8 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Auto-scan CPU OPP on load */
@@ -1008,4 +1020,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.7");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.8");
