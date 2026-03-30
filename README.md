@@ -1,6 +1,6 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v6.5) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (v6.10) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 - **CPU OPP reader** — exports CSRAM LUT data to userspace
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
@@ -37,7 +37,7 @@ Kernel module (v6.5) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 Each LUT entry is a 4-byte word in descending frequency order (up to 32 entries per domain):
 
-```
+```text
 bits[11:0]   = Frequency (MHz)
 bits[30:29]  = Gear selector (voltage domain switch — preserved on OC write)
 Voltage (µV) = ((raw & 0x9FFFFFFF) >> 12) * 10
@@ -76,9 +76,12 @@ Voltage (µV) = ((raw & 0x9FFFFFFF) >> 12) * 10
 | `gpu_oc_apply` | W | Write `1` to re-apply GPU OC |
 | `gpu_oc_result` | R | Result string: `OK:patched=3,freq=...` or `FAIL:...` |
 
-`patched=3` (bits 0+1) is the expected success value:
-- bit 0 = `g_gpu_default_opp_table[0]` patched
-- bit 1 = working table (via `gpufreq_get_working_table` wrapper API) patched
+`patched=3` is the common success value on this device:
+- bit 0 (`1`) = `g_gpu_default_opp_table[0]` patched
+- bit 1 (`2`) = working table (via `gpufreq_get_working_table` wrapper API) patched
+
+`signed_table` patching may be unavailable at runtime; this does not block the
+normal success path.
 
 ## Building
 
@@ -131,9 +134,11 @@ cat /proc/gpufreqv2/gpu_working_opp_table | head -1
 - **No hard symbol dependencies**: `cpufreq_cpu_get` / `cpufreq_cpu_put` are resolved at runtime via `kallsyms_lookup_name` — the module has zero hard dependencies on the cpufreq subsystem, ensuring safe loading at any boot stage
 - **KCFI**: Functions calling kallsyms-resolved pointers are marked `__nocfi` (includes `set_cpu_oc`, `resolve_cpufreq_symbols`, GPU resolve/patch functions)
 - **GPU GPUEB mode**: `__gpufreq_get_working_table_gpu()` returns NULL when GPU is powered off; the module falls back to `gpufreq_get_working_table(0)` (wrapper public API) which reads `g_shared_status` — always CPU-accessible
-- **kthread safety**: After the 120 s poll loop, the kthread blocks on `kthread_should_stop()` to prevent UAF on `rmmod`
+- **GPU relift**: in v6.10 the GPU kthread runs for the module lifetime and re-applies runtime GPU table patching every 500 ms, so runtime refreshes do not silently revert OC after the UI is closed or the GPU power-cycles
+- **kthread safety**: the GPU relift kthread exits only via `kthread_stop()` to prevent UAF on `rmmod`
 - **CPU OC mechanism**: Writes new LUT entry (freq + volt, preserving gear-selector bits) to CSRAM, then updates `cpufreq_policy` freq_table max entry, `policy->max`, and `cpuinfo.max_freq` so the governor can target the new ceiling
 - **Boot-time OC**: When loaded with nonzero `cpu_oc_*_freq` params (e.g. from APatch service.sh), CPU OC is auto-applied during `kpm_oc_init`
+- **GPU max reporting caveat**: some generic kernel-manager apps still show the stock 1400 MHz ceiling because they read devfreq `max_freq`; verify effective GPU OC via `/proc/gpufreqv2/gpu_working_opp_table` and `gpu_oc_result`
 
 ## License
 
