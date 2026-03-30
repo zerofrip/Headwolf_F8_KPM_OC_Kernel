@@ -250,6 +250,8 @@ static unsigned long           pt_policy_list_sym; /* mtk_cpu_power_throttling l
 static struct delayed_work cpu_oc_relift_dwork;
 static bool cpu_oc_relift_active;
 static unsigned int cpu_oc_targets[NUM_CLUSTERS]; /* per-cluster OC target KHz, 0=off */
+/* Cached &policy->constraints per cluster for kprobe interception */
+static struct freq_constraints *cluster_qos_ptr[NUM_CLUSTERS];
 
 static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work);
 
@@ -445,6 +447,8 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 						cluster_names[c], user_prio_before,
 						agg_before, policy->max);
 				}
+				/* Cache constraints ptr for kprobe interception */
+				WRITE_ONCE(cluster_qos_ptr[c], &policy->constraints);
 				if (fn_cpufreq_cpu_put)
 					fn_cpufreq_cpu_put(policy);
 				pr_info("KPM_OC: CPU %s cpufreq policy updated to %uKHz (incl. user freq_qos)\n",
@@ -537,11 +541,91 @@ static int cpu_oc_dummy;
 module_param_cb(cpu_oc_apply, &cpu_oc_ops, &cpu_oc_dummy, 0220);
 MODULE_PARM_DESC(cpu_oc_apply, "Write 1 to patch CPU CSRAM LUT[0] + cpufreq policy max");
 
+/* ─── kprobe: zero-latency freq_qos_update_request intercept ────────────── */
+/*
+ * Vendor modules call freq_qos_update_request() to re-assert stock MAX
+ * constraints on the cpufreq policy (powerhal, fpsgo, battery throttling).
+ * Instead of waiting up to RELIFT_INTERVAL_MS for the periodic worker to
+ * notice and fix the value, we intercept every call and silently raise the
+ * argument back to the OC target before the function executes.
+ *
+ * AArch64 calling convention: x0 = req (struct freq_qos_request *),
+ *                              x1 = new_value (s32).
+ * Safety: handler only reads ONCE variables; no spinlocks, no alloc.
+ */
+static int __nocfi freq_qos_kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct freq_qos_request *req;
+	s32 new_value;
+	int c;
+
+	req       = (struct freq_qos_request *)(uintptr_t)regs->regs[0];
+	new_value = (s32)regs->regs[1];
+
+	if (!req || new_value <= 0)
+		return 0;
+
+	/* Only intercept MAX constraint lowering */
+	if (req->type != FREQ_QOS_MAX)
+		return 0;
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int target = READ_ONCE(cpu_oc_targets[c]);
+		struct freq_constraints *qp = READ_ONCE(cluster_qos_ptr[c]);
+
+		if (target == 0 || !qp)
+			continue;
+
+		if (req->qos == qp && (unsigned int)new_value < target) {
+			/* Override: caller will use OC target instead of stock value */
+			regs->regs[1] = (u64)target;
+			pr_info_ratelimited("KPM_OC: kp: intercepted c%d %d->%u\n",
+					    c, new_value, target);
+			return 0;
+		}
+		/* Debug: log requests that would lower this cluster but have wrong qos */
+		if ((unsigned int)new_value < target && qp)
+			pr_info_ratelimited("KPM_OC: kp: MISS c%d val=%d qos=%px expected=%px\n",
+					    c, new_value, req->qos, qp);
+	}
+	return 0;
+}
+
+static struct kprobe freq_qos_kp = {
+	.symbol_name = "freq_qos_update_request",
+	.pre_handler = freq_qos_kp_pre,
+};
+
+/* kprobe: intercept update_userlimit_cpufreq_max (powerhal/touch_boost)
+ * AArch64: x0 = cluster_idx (int), x1 = max_khz (unsigned int)
+ */
+static int __nocfi userlimit_kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	int cluster = (int)regs->regs[0];
+	unsigned int new_max = (unsigned int)regs->regs[1];
+	unsigned int target;
+
+	if (cluster < 0 || cluster >= NUM_CLUSTERS)
+		return 0;
+
+	target = READ_ONCE(cpu_oc_targets[cluster]);
+	if (target > 0 && new_max < target)
+		regs->regs[1] = (u64)target;
+
+	return 0;
+}
+
+static struct kprobe userlimit_kp = {
+	.symbol_name = "update_userlimit_cpufreq_max",
+	.pre_handler = userlimit_kp_pre,
+};
+
 /* ─── Periodic freq_qos re-lift worker ──────────────────────────────────── */
 /*
  * Vendor modules (powerhal, fpsgo, mtk_cpu_power_throttling) periodically
  * re-assert FREQ_QOS_MAX constraints to the stock max.  This worker checks
  * the aggregate every RELIFT_INTERVAL_MS and re-lifts as needed.
+ * With the kprobe active this worker acts as a safety net only.
  */
 static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 {
@@ -580,6 +664,32 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 
 			policy->max = target;
 			policy->cpuinfo.max_freq = target;
+
+			/*
+			 * Walk policy->constraints MAX plist and raise every
+			 * request that is below the OC target.  This catches
+			 * unknown vendor requests that bypass known symbols.
+			 * Collect pointers before updating to avoid walking a
+			 * list that changes under us.
+			 */
+			if (fn_freq_qos_update_req) {
+				struct plist_head *ph =
+					&policy->constraints.max_freq.list;
+				struct plist_node *pn;
+				struct freq_qos_request *rqs[32];
+				int nrq = 0, i;
+
+				plist_for_each(pn, ph) {
+					if ((unsigned int)pn->prio < target &&
+					    nrq < (int)ARRAY_SIZE(rqs))
+						rqs[nrq++] = container_of(
+							pn,
+							struct freq_qos_request,
+							pnode);
+				}
+				for (i = 0; i < nrq; i++)
+					fn_freq_qos_update_req(rqs[i], target);
+			}
 
 			if (fn_cpufreq_cpu_put)
 				fn_cpufreq_cpu_put(policy);
@@ -971,8 +1081,29 @@ static int __init kpm_oc_init(void)
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
 	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.8 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.9 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
+
+	/* Register kprobe to intercept freq_qos_update_request at call time */
+	{
+		int kret = register_kprobe(&freq_qos_kp);
+
+		if (kret < 0)
+			pr_warn("KPM_OC: freq_qos kprobe failed (%d); periodic relift only\n",
+				kret);
+		else
+			pr_info("KPM_OC: freq_qos_update_request kprobe registered\n");
+	}
+
+	{
+		int kret2 = register_kprobe(&userlimit_kp);
+
+		if (kret2 < 0)
+			pr_warn("KPM_OC: userlimit kprobe failed (%d); powerhal only patched on relift\n",
+				kret2);
+		else
+			pr_info("KPM_OC: update_userlimit_cpufreq_max kprobe registered\n");
+	}
 
 	/* Auto-scan CPU OPP on load */
 	set_apply("1", NULL);
@@ -1005,6 +1136,8 @@ static int __init kpm_oc_init(void)
 
 static void __exit kpm_oc_exit(void)
 {
+	unregister_kprobe(&freq_qos_kp);
+	unregister_kprobe(&userlimit_kp);
 	cpu_oc_relift_active = false;
 	cancel_delayed_work_sync(&cpu_oc_relift_dwork);
 	if (gpu_oc_task) {
