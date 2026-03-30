@@ -5,6 +5,8 @@
  * - CPU OC: patches CSRAM LUT[0] per cluster + cpufreq policy max.
  * - GPU OC: patches default + working + shared_status OPP tables.
  *   v6.4: CPU OC support added.
+ *   v6.6: Lift vendor freq_qos MAX constraints (powerhal, fpsgo, touch_boost)
+ *         so scaling_max_freq can reach the OC'd frequency.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -205,6 +207,38 @@ typedef void (*cpufreq_cpu_put_t)(struct cpufreq_policy *policy);
 static cpufreq_cpu_get_t fn_cpufreq_cpu_get;
 static cpufreq_cpu_put_t fn_cpufreq_cpu_put;
 
+/*
+ * Vendor freq_qos constraint updaters — resolved via kallsyms.
+ *
+ * powerhal_cpu_ctrl + touch_boost share a FREQ_QOS_MAX constraint per cluster
+ * via a global freq_max_request[], initialised to the stock max frequency.
+ * update_userlimit_cpufreq_max(cluster_idx, freq_khz) updates that constraint.
+ *
+ * mtk_fpsgo adds its own FREQ_QOS_MAX constraint per cluster via fbt_cpu_rq[],
+ * also initialised to the stock max.  fbt_cpu_rq is a pointer-to-array where
+ * each element (struct freq_qos_request) has stride 64 bytes.
+ *
+ * Without updating both, scaling_max_freq is clamped to the stock maximum
+ * even when cpuinfo.max_freq has been raised by the OC patch.
+ */
+typedef void (*update_userlimit_max_t)(int cluster, int freq);
+typedef int  (*freq_qos_update_req_t)(void *req, int new_value);
+
+static update_userlimit_max_t  fn_update_userlimit_max;
+static freq_qos_update_req_t  fn_freq_qos_update_req;
+static unsigned long           fbt_cpu_rq_sym;   /* &fbt_cpu_rq (pointer) */
+typedef s32  (*freq_qos_read_value_t)(void *qos, int type);
+
+static freq_qos_read_value_t   fn_freq_qos_read_value;
+static unsigned long           pt_policy_list_sym; /* mtk_cpu_power_throttling list head */
+#define FBT_RQ_STRIDE 64  /* bytes per cluster in fbt_cpu_rq array; confirmed by lsl #6 in disasm */
+
+/* Reverse-engineered from mtk_cpu_power_throttling callbacks:
+ * list node at +0x60, freq_qos_request at +0x18 (node - 0x48).
+ */
+#define CPU_PT_NODE_TO_REQ_OFF 0x48
+#define CPU_PT_NODE_TO_FLAG_OFF 0x60
+
 static void __nocfi resolve_cpufreq_symbols(void)
 {
 	if (!kln_func)
@@ -215,6 +249,19 @@ static void __nocfi resolve_cpufreq_symbols(void)
 	if (!fn_cpufreq_cpu_put)
 		fn_cpufreq_cpu_put =
 			(cpufreq_cpu_put_t)kln_func("cpufreq_cpu_put");
+	if (!fn_update_userlimit_max)
+		fn_update_userlimit_max =
+			(update_userlimit_max_t)kln_func("update_userlimit_cpufreq_max");
+	if (!fn_freq_qos_update_req)
+		fn_freq_qos_update_req =
+			(freq_qos_update_req_t)kln_func("freq_qos_update_request");
+	if (!fbt_cpu_rq_sym)
+		fbt_cpu_rq_sym = kln_func("fbt_cpu_rq");
+	if (!fn_freq_qos_read_value)
+		fn_freq_qos_read_value =
+			(freq_qos_read_value_t)kln_func("freq_qos_read_value");
+	if (!pt_policy_list_sym)
+		pt_policy_list_sym = kln_func("pt_policy_list");
 }
 
 /* ─── CPU OC via CSRAM LUT[0] patch + cpufreq policy update ─────────────── */
@@ -357,12 +404,93 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 				}
 				policy->max                 = target_khz;
 				policy->cpuinfo.max_freq    = target_khz;
+				/*
+				 * Update the user's own freq_qos MAX request
+				 * (policy->max_freq_req) to the OC frequency.
+				 * Without this, the freq_qos aggregate stays at the
+				 * boot-time cpuinfo.max_freq (= stock max), clamping
+				 * subsequent sysfs scaling_max_freq writes.
+				 */
+				if (fn_freq_qos_update_req && policy->max_freq_req)
+					fn_freq_qos_update_req(
+						policy->max_freq_req,
+						target_khz);
+				/* Diagnostic: read user_prio and aggregate BEFORE cpu_put */
+				{
+					s32 user_prio_before = -1;
+					s32 agg_before = -1;
+
+					if (policy->max_freq_req)
+						user_prio_before =
+							*(s32 *)((char *)policy->max_freq_req + 8);
+					if (fn_freq_qos_read_value)
+						agg_before = fn_freq_qos_read_value(
+							&policy->constraints,
+							2 /* FREQ_QOS_MAX */);
+					pr_info("KPM_OC: CPU %s PRE-PUT: user_prio=%d agg_max=%d policy_max=%u\n",
+						cluster_names[c], user_prio_before,
+						agg_before, policy->max);
+				}
 				if (fn_cpufreq_cpu_put)
 					fn_cpufreq_cpu_put(policy);
-				pr_info("KPM_OC: CPU %s cpufreq policy->max updated to %uKHz\n",
+				pr_info("KPM_OC: CPU %s cpufreq policy updated to %uKHz (incl. user freq_qos)\n",
 					cluster_names[c], target_khz);
 			}
 		}
+
+		/* ── Lift vendor freq_qos MAX constraints to the OC frequency ── */
+		/*
+		 * powerhal_cpu_ctrl + touch_boost share freq_max_request[c]:
+		 * update_userlimit_cpufreq_max(cluster_idx, target_khz)
+		 */
+		if (fn_update_userlimit_max) {
+			fn_update_userlimit_max(c, target_khz);
+			pr_info("KPM_OC: CPU %s powerhal freq_qos MAX -> %uKHz\n",
+				cluster_names[c], target_khz);
+		}
+
+		/*
+		 * mtk_fpsgo's fbt_cpu_rq[c] (stride 64 bytes):
+		 * freq_qos_update_request(&fbt_cpu_rq[c], target_khz)
+		 */
+		if (fn_freq_qos_update_req && fbt_cpu_rq_sym) {
+			void *rq_base = *(void **)fbt_cpu_rq_sym;
+			if (rq_base) {
+				void *rq = (char *)rq_base + c * FBT_RQ_STRIDE;
+				int fret = fn_freq_qos_update_req(rq, target_khz);
+				s32 agg_after = fn_freq_qos_read_value ?
+					fn_freq_qos_read_value(
+						*(void **)((char *)rq +
+							   offsetof(struct freq_qos_request, qos)),
+						2 /* FREQ_QOS_MAX */) : -999;
+				pr_info("KPM_OC: CPU %s fpsgo freq_qos MAX -> %uKHz (ret=%d agg=%d)\n",
+					cluster_names[c], target_khz, fret, agg_after);
+			}
+		}
+	}
+
+	/*
+	 * mtk_cpu_power_throttling dynamically applies extra FREQ_QOS_MAX limits
+	 * via pt_policy_list callbacks (low battery / over-current / battery %).
+	 * Lift all active requests to INT_MAX so they don't silently clamp OC.
+	 */
+	if (fn_freq_qos_update_req && pt_policy_list_sym) {
+		struct list_head *head = (struct list_head *)pt_policy_list_sym;
+		struct list_head *pos;
+		int n = 0;
+
+		list_for_each(pos, head) {
+			u32 active = *(u32 *)((char *)pos - CPU_PT_NODE_TO_FLAG_OFF);
+			void *rq = (char *)pos - CPU_PT_NODE_TO_REQ_OFF;
+
+			if (active == 0)
+				continue;
+			fn_freq_qos_update_req(rq, INT_MAX);
+			n++;
+		}
+		if (n > 0)
+			pr_info("KPM_OC: Lifted %d mtk_cpu_power_throttling freq_qos MAX requests to INT_MAX\n",
+				n);
 	}
 
 	if (pos > 0 && cpu_oc_result[pos - 1] == ',')
@@ -724,7 +852,7 @@ static int __init kpm_oc_init(void)
 	}
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.5 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.6 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Auto-scan CPU OPP on load */
@@ -771,4 +899,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.5");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.6");
