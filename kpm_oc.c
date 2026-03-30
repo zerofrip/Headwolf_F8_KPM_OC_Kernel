@@ -811,7 +811,8 @@ static gpufreq_update_shared_t fn_update_shared_status_opp_table;
  */
 static int gpu_oc_patched;
 
-/* Kthread for delayed patch (polls until GPU probe completes) */
+/* Kthread for GPU relift (periodically re-patches working/signed tables) */
+#define GPU_RELIFT_INTERVAL_MS 500
 static struct task_struct *gpu_oc_task;
 
 static void __nocfi gpu_resolve_runtime_symbols(void)
@@ -842,23 +843,33 @@ static void __nocfi gpu_resolve_runtime_symbols(void)
 
 static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
 {
-    u32 freq;
+	u32 freq;
+	u32 volt;
+	u32 vsram;
 
-    if (!tbl)
-        return 0;
+	if (!tbl)
+		return 0;
 
-    freq = tbl[0];
-    if (freq < 1000000 || freq > 2000000) {
-        pr_warn("KPM_OC: %s[0] unexpected freq=%u, skip\n", name, freq);
-        return 0;
-    }
+	freq = tbl[0];
+	volt = tbl[1];
+	vsram = tbl[2];
+	if (freq < 1000000 || freq > 2000000) {
+		pr_warn("KPM_OC: %s[0] unexpected freq=%u, skip\n", name, freq);
+		return 0;
+	}
 
-    pr_info("KPM_OC: %s[0] at %px freq=%u -> %u\n",
-        name, tbl, freq, gpu_target_freq);
-    tbl[0] = gpu_target_freq;
-    tbl[1] = gpu_target_volt;
-    tbl[2] = gpu_target_vsram;
-    return bit;
+	if (freq == gpu_target_freq &&
+	    volt == gpu_target_volt &&
+	    vsram == gpu_target_vsram)
+		return bit;
+
+	pr_info("KPM_OC: %s[0] at %px freq=%u->%u volt=%u->%u vsram=%u->%u\n",
+		name, tbl, freq, gpu_target_freq, volt, gpu_target_volt,
+		vsram, gpu_target_vsram);
+	tbl[0] = gpu_target_freq;
+	tbl[1] = gpu_target_volt;
+	tbl[2] = gpu_target_vsram;
+	return bit;
 }
 
 /*
@@ -941,57 +952,49 @@ static void __nocfi gpu_oc_diagnostic(void)
 }
 
 /*
- * Kthread function: polls every 500 ms until working_table and shared_status
- * are both patched, or until 120 seconds have elapsed.
+ * Kthread function: runs for the module lifetime and periodically re-applies
+ * working/signed table patching.  This keeps GPU OC active even after GPU
+ * power-cycle or vendor-side runtime table refresh.
  */
 static int gpu_oc_kthread_fn(void *data)
 {
-	int tries = 0;
-	bool diag_done = false;
+	int miss_cnt = 0;
+	int last_state = 0;
 
-	pr_info("KPM_OC: delayed-patch kthread started (max 120 s)\n");
+	pr_info("KPM_OC: GPU relift kthread started (%d ms)\n",
+		GPU_RELIFT_INTERVAL_MS);
 
-	while (!kthread_should_stop() && tries < 240) {
-		msleep(500);
-		tries++;
+	while (!kthread_should_stop()) {
+		int now;
 
-		if ((gpu_oc_patched & 6) == 6)
-			break;
+		msleep(GPU_RELIFT_INTERVAL_MS);
+
+		if (READ_ONCE(gpu_target_freq) == 0)
+			continue;
 
 		mutex_lock(&lock);
 		gpu_oc_patched |= gpu_oc_patch_wk_ss();
+		now = gpu_oc_patched & 6;
 		mutex_unlock(&lock);
 
-		/* After 35 s, dump diagnostics once if still not fully patched */
-		if (!diag_done && tries >= 70 && (gpu_oc_patched & 6) != 6) {
-			mutex_lock(&lock);
-			gpu_oc_diagnostic();
-			mutex_unlock(&lock);
-			diag_done = true;
+		if (now == 6 && last_state != 6)
+			pr_info("KPM_OC: GPU relift: working+signed patched (patched=%d)\n",
+				gpu_oc_patched);
+
+		if (now != 6) {
+			miss_cnt++;
+			if (miss_cnt >= 600) {
+				mutex_lock(&lock);
+				gpu_oc_diagnostic();
+				mutex_unlock(&lock);
+				miss_cnt = 0;
+			}
+		} else {
+			miss_cnt = 0;
 		}
-	}
 
-	if ((gpu_oc_patched & 6) == 6) {
-		pr_info("KPM_OC: kthread: GPU OC fully applied after %d*500ms (patched=%d)\n",
-			tries, gpu_oc_patched);
-		/* Update result string */
-		mutex_lock(&lock);
-		snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
-			 "OK:patched=%d,freq=%u,volt=%u,vsram=%u (kthread)",
-			 gpu_oc_patched, gpu_target_freq,
-			 gpu_target_volt, gpu_target_vsram);
-		mutex_unlock(&lock);
-	} else {
-		pr_warn("KPM_OC: kthread: timed out, patched=%d\n",
-			gpu_oc_patched);
+		last_state = now;
 	}
-
-	/* Block until kthread_stop() is called from module exit.
-	 * Returning while gpu_oc_task is still set would cause
-	 * kthread_stop() to dereference a freed task_struct.
-	 */
-	while (!kthread_should_stop())
-		msleep(500);
 
 	return 0;
 }
@@ -1081,7 +1084,7 @@ static int __init kpm_oc_init(void)
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
 	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.9 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.10 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Register kprobe to intercept freq_qos_update_request at call time */
@@ -1116,10 +1119,10 @@ static int __init kpm_oc_init(void)
 	set_gpu_oc("1", NULL);
 
 	/*
-	 * If runtime tables are still unavailable (GPU probe not yet done),
-	 * start a kthread that polls until working+signed tables are patched.
+	 * Start GPU relift kthread for module lifetime so runtime table refreshes
+	 * from vendor/GPUEB side cannot silently drop OC back to stock.
 	 */
-	if ((gpu_oc_patched & 6) != 6) {
+	if (gpu_target_freq > 0) {
 		gpu_oc_task = kthread_run(gpu_oc_kthread_fn, NULL,
 					  "gpu_oc_worker");
 		if (IS_ERR(gpu_oc_task)) {
@@ -1153,4 +1156,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.8");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.10");
