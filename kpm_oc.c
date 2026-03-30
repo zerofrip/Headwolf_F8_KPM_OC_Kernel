@@ -7,6 +7,8 @@
  *   v6.4: CPU OC support added.
  *   v6.6: Lift vendor freq_qos MAX constraints (powerhal, fpsgo, touch_boost)
  *         so scaling_max_freq can reach the OC'd frequency.
+ *   v6.7: Periodic relift worker — vendor modules re-assert freq_qos MAX
+ *         constraints, so a delayed_work keeps them lifted while OC is active.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -19,6 +21,7 @@
 #include <linux/delay.h>
 #include <linux/string.h>
 #include <linux/cpufreq.h>
+#include <linux/workqueue.h>
 
 /* ─── CSRAM Configuration ───────────────────────────────────────────────── */
 /*
@@ -238,6 +241,16 @@ static unsigned long           pt_policy_list_sym; /* mtk_cpu_power_throttling l
  */
 #define CPU_PT_NODE_TO_REQ_OFF 0x48
 #define CPU_PT_NODE_TO_FLAG_OFF 0x60
+
+/* Periodic relift worker — re-lifts vendor freq_qos MAX constraints that
+ * get re-asserted by powerhal, fpsgo, battery throttling, etc.
+ */
+#define RELIFT_INTERVAL_MS 5000
+static struct delayed_work cpu_oc_relift_dwork;
+static bool cpu_oc_relift_active;
+static unsigned int cpu_oc_targets[NUM_CLUSTERS]; /* per-cluster OC target KHz, 0=off */
+
+static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work);
 
 static void __nocfi resolve_cpufreq_symbols(void)
 {
@@ -499,6 +512,18 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 		snprintf(cpu_oc_result, CPU_RESULT_BUF_SIZE,
 			 "NOOP:no cluster targets set");
 
+	/* Record per-cluster OC targets and start the periodic relift worker */
+	for (c = 0; c < NUM_CLUSTERS; c++)
+		cpu_oc_targets[c] = *tgt_freqs[c];
+
+	if (any_patched > 0 && !cpu_oc_relift_active) {
+		cpu_oc_relift_active = true;
+		schedule_delayed_work(&cpu_oc_relift_dwork,
+				      msecs_to_jiffies(RELIFT_INTERVAL_MS));
+		pr_info("KPM_OC: periodic relift worker started (%d ms)\n",
+			RELIFT_INTERVAL_MS);
+	}
+
 	mutex_unlock(&lock);
 	return 0;
 }
@@ -507,6 +532,87 @@ static const struct kernel_param_ops cpu_oc_ops = { .set = set_cpu_oc };
 static int cpu_oc_dummy;
 module_param_cb(cpu_oc_apply, &cpu_oc_ops, &cpu_oc_dummy, 0220);
 MODULE_PARM_DESC(cpu_oc_apply, "Write 1 to patch CPU CSRAM LUT[0] + cpufreq policy max");
+
+/* ─── Periodic freq_qos re-lift worker ──────────────────────────────────── */
+/*
+ * Vendor modules (powerhal, fpsgo, mtk_cpu_power_throttling) periodically
+ * re-assert FREQ_QOS_MAX constraints to the stock max.  This worker checks
+ * the aggregate every RELIFT_INTERVAL_MS and re-lifts as needed.
+ */
+static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
+{
+	int c;
+	bool any_lifted = false;
+
+	if (!cpu_oc_relift_active)
+		return;
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int target = cpu_oc_targets[c];
+		struct cpufreq_policy *policy;
+		s32 agg_max;
+
+		if (target == 0)
+			continue;
+
+		policy = fn_cpufreq_cpu_get ?
+			fn_cpufreq_cpu_get(cluster_policies[c]) : NULL;
+		if (!policy)
+			continue;
+
+		agg_max = fn_freq_qos_read_value ?
+			fn_freq_qos_read_value(&policy->constraints,
+					       2 /* FREQ_QOS_MAX */) : (s32)target;
+
+		if ((unsigned int)agg_max < target) {
+			/* Re-lift user request */
+			if (fn_freq_qos_update_req && policy->max_freq_req)
+				fn_freq_qos_update_req(policy->max_freq_req, target);
+
+			if (fn_cpufreq_cpu_put)
+				fn_cpufreq_cpu_put(policy);
+
+			/* powerhal / touch_boost */
+			if (fn_update_userlimit_max)
+				fn_update_userlimit_max(c, target);
+
+			/* fpsgo */
+			if (fn_freq_qos_update_req && fbt_cpu_rq_sym) {
+				void *rq_base = *(void **)fbt_cpu_rq_sym;
+				if (rq_base)
+					fn_freq_qos_update_req(
+						(char *)rq_base + c * FBT_RQ_STRIDE,
+						target);
+			}
+
+			/* power throttling */
+			if (fn_freq_qos_update_req && pt_policy_list_sym) {
+				struct list_head *head = (struct list_head *)pt_policy_list_sym;
+				struct list_head *pos;
+				list_for_each(pos, head) {
+					u32 active = *(u32 *)((char *)pos - CPU_PT_NODE_TO_FLAG_OFF);
+					if (active)
+						fn_freq_qos_update_req(
+							(char *)pos - CPU_PT_NODE_TO_REQ_OFF,
+							INT_MAX);
+				}
+			}
+
+			pr_info("KPM_OC: relift %s: agg_max %d -> %u\n",
+				cluster_names[c], agg_max, target);
+			any_lifted = true;
+		} else {
+			if (fn_cpufreq_cpu_put)
+				fn_cpufreq_cpu_put(policy);
+		}
+	}
+
+	(void)any_lifted;
+
+	if (cpu_oc_relift_active)
+		schedule_delayed_work(&cpu_oc_relift_dwork,
+				      msecs_to_jiffies(RELIFT_INTERVAL_MS));
+}
 
 /* ─── GPU OPP Runtime Memory Patcher ────────────────────────────────────── */
 /*
@@ -852,7 +958,8 @@ static int __init kpm_oc_init(void)
 	}
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.6 (base=0x%lx)\n",
+	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v6.7 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Auto-scan CPU OPP on load */
@@ -886,6 +993,8 @@ static int __init kpm_oc_init(void)
 
 static void __exit kpm_oc_exit(void)
 {
+	cpu_oc_relift_active = false;
+	cancel_delayed_work_sync(&cpu_oc_relift_dwork);
 	if (gpu_oc_task) {
 		kthread_stop(gpu_oc_task);
 		gpu_oc_task = NULL;
@@ -899,4 +1008,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.6");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v6.7");
