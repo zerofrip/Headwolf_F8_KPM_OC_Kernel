@@ -1,12 +1,14 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v7.0) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (v7.2) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 - **CPU OPP reader** — exports CSRAM LUT data to userspace
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
 - **CPU per-LUT voltage override** — direct CSRAM write for any LUT entry, bypassing stock constraints
+- **MCUPM CSRAM countermeasure** *(v7.2)* — kprobes on CPU DVFS transition functions resync OC voltages into CSRAM immediately before every frequency transition, preventing MCUPM firmware from silently reverting them
 - **GPU overclocking** — patches the GPU default + working OPP tables in kernel memory at runtime
 - **GPU per-OPP voltage override** — direct memory write for any OPP entry, bypassing vendor `fix_custom_freq_volt` validation
+- **GPUEB OPP countermeasure** *(v7.2)* — kprobe on the GPU DVFS commit function re-patches OPP voltages immediately before the commit reads them, preventing GPUEB firmware from reverting OC voltage
 
 ## Hardware Details
 
@@ -59,6 +61,42 @@ u32 power;
 ```
 
 Total OPP count: 69 (SignedOPPNum), 65 working OPPs on this SoC.
+
+## MCUPM / GPUEB Countermeasure (v7.2)
+
+### Root Cause
+
+The MT8792 has two firmware subsystems that independently write back into DVFS tables:
+
+- **MCUPM** (CPU Management Processor, base `0xc070000`) — has direct CSRAM access and continuously recalculates LUT voltage fields during cpufreq transitions. Frequency bits `[11:0]` are preserved (OC freq holds), but voltage bits `[28:12]` are overwritten with MCUPM-computed values that do not account for frequencies above stock range.
+- **GPUEB** (GPU Execution Block) — overwrites `g_shared_status` / `working_table` voltage on every GPU DVFS commit. The AP-kernel `g_gpu_default_opp_table` is also reverted by a kernel-side sync from shared_status. Voltage reverts from the OC target (e.g. 105000) to stock (e.g. 40500) within milliseconds of each patch.
+
+A 500 ms periodic relift cannot keep up with these firmware write-backs.
+
+### Solution: Event-Driven Resync via kprobes
+
+Instead of polling, v7.2 installs kprobes that fire on the exact functions called during DVFS transitions:
+
+| kprobe symbol | Module | Purpose |
+|---------------|--------|---------|
+| `mtk_cpufreq_hw_fast_switch` | `mediatek_cpufreq_hw` | Re-patch CSRAM LUT voltages before fast-switch path |
+| `mtk_cpufreq_hw_target_index` | `mediatek_cpufreq_hw` | Re-patch CSRAM LUT voltages before target-index path |
+| `__gpufreq_generic_commit_gpu` | `mtk_gpufreq_mt6897` | Re-patch GPU default + working OPP[0] before commit reads them |
+
+The pre-handler for each CPU kprobe calls `cpu_csram_resync_fast()`, which writes OC voltages to CSRAM for all clusters nanoseconds before the HW reads `REG_FREQ_PERF_STATE`. The GPU kprobe pre-handler re-patches `default_table[0]` and `working_table[0]` before `__gpufreq_generic_commit_gpu` dereferences them.
+
+The 500 ms periodic relift worker is kept as a safety net for edge cases.
+
+### Verified Results
+
+After loading v7.2 with OC targets (L=3800 MHz, B=3800 MHz, P=3800 MHz, GPU=3000 MHz):
+
+| Metric | Before v7.2 | After v7.2 |
+|--------|-------------|------------|
+| CPU CSRAM L LUT[0] volt | 831 250 µV (MCUPM-overwritten) | **1 050 000 µV** (stable) |
+| CPU CSRAM B LUT[0] volt | ~1 006 250 µV (unstable) | **1 100 000 µV** (stable) |
+| CPU CSRAM P LUT[0] volt | ~1 087 500 µV (unstable) | **1 150 000 µV** (stable) |
+| GPU working OPP[0] volt | 40 500 (GPUEB-reverted) | **105 000** (stable) |
 
 ## Sysfs Interface
 
@@ -219,6 +257,8 @@ cat /proc/gpufreqv2/gpu_working_opp_table | head -5
 - **GKI compatibility**: `kallsyms_lookup_name` is resolved via kprobe (not directly exported in GKI 6.1)
 - **No hard symbol dependencies**: `cpufreq_cpu_get` / `cpufreq_cpu_put` are resolved at runtime via `kallsyms_lookup_name` — the module has zero hard dependencies on the cpufreq subsystem, ensuring safe loading at any boot stage
 - **KCFI**: Functions calling kallsyms-resolved pointers are marked `__nocfi` (includes `set_cpu_oc`, `resolve_cpufreq_symbols`, `set_gpu_volt_ov`, GPU resolve/patch functions)
+- **MCUPM countermeasure** *(v7.2)*: kprobes on `mtk_cpufreq_hw_fast_switch` and `mtk_cpufreq_hw_target_index` (both in `[mediatek_cpufreq_hw]`) call `cpu_csram_resync_fast()` in their pre-handlers to re-write OC LUT voltages into CSRAM before every DVFS transition. The CSRAM read at an arbitrary moment may still show MCUPM-computed values for non-target OPPs; what matters is the voltage is correct at the pre-handler instant
+- **GPUEB countermeasure** *(v7.2)*: kprobe on `__gpufreq_generic_commit_gpu` (in `[mtk_gpufreq_mt6897]`) re-patches `default_table[0]` and `working_table[0]` with OC freq/volt/vsram before commit reads them. Total kprobes registered at init: 5
 - **GPU GPUEB mode**: `__gpufreq_get_working_table_gpu()` returns NULL when GPU is powered off; the module falls back to `gpufreq_get_working_table(0)` (wrapper public API) which reads `g_shared_status` — always CPU-accessible
 - **GPU relift**: the GPU kthread runs for the module lifetime and re-applies all GPU table patches (OPP[0] OC + per-OPP voltage overrides) every 500 ms, keeping OC active through GPU power-cycles and vendor runtime refreshes
 - **kthread safety**: the GPU relift kthread exits only via `kthread_stop()` to prevent UAF on `rmmod`

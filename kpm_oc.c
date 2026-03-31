@@ -13,6 +13,17 @@
  *   v7.0: Per-OPP voltage override for all CPU LUT entries and GPU OPP entries.
  *         Bypasses vendor fix_custom_freq_volt validation (DVFSState, volt clamp)
  *         by writing directly to CSRAM / kernel memory.
+ *   v7.2: MCUPM/GPUEB CSRAM overwrite countermeasure.
+ *         Root cause: MCUPM firmware continuously recalculates and overwrites
+ *         CSRAM LUT voltage fields; GPUEB firmware overwrites GPU OPP table
+ *         voltages via shared_status.  Previous 500ms periodic relift could
+ *         not keep up.
+ *         Fix: Event-driven voltage resync via kprobes on:
+ *         - mtk_cpufreq_hw_fast_switch / mtk_cpufreq_hw_target_index
+ *           (re-patches CSRAM LUT before HW reads it on every DVFS transition)
+ *         - __gpufreq_generic_commit_gpu
+ *           (re-patches GPU OPP tables before commit reads them)
+ *         Periodic relift retained as safety net only.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -257,6 +268,10 @@ static unsigned int cpu_oc_targets[NUM_CLUSTERS]; /* per-cluster OC target KHz, 
 static struct freq_constraints *cluster_qos_ptr[NUM_CLUSTERS];
 
 static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work);
+
+/* Forward declarations for CPU voltage override (defined after GPU section) */
+static unsigned int cpu_volt_ov[NUM_CLUSTERS][LUT_MAX_ENTRIES];
+static int          cpu_volt_ov_count;
 
 static void __nocfi resolve_cpufreq_symbols(void)
 {
@@ -623,6 +638,145 @@ static struct kprobe userlimit_kp = {
 	.pre_handler = userlimit_kp_pre,
 };
 
+/* ─── MCUPM CSRAM countermeasure: event-driven voltage resync ───────────
+ *
+ * Root cause: MCUPM firmware runs on a dedicated MCU and has direct access
+ * to CSRAM.  It continuously recalculates and overwrites LUT voltage fields
+ * (freq bits[11:0] are preserved, but bits[28:12] = voltage are replaced).
+ * The periodic 500ms relift cannot keep up — there is always a window where
+ * CSRAM holds an incorrect (MCUPM-computed) voltage for the OC'd frequency.
+ *
+ * Fix: Kprobe on mtk_cpufreq_hw_fast_switch / mtk_cpufreq_hw_target_index.
+ * These are called on every CPU DVFS transition, right before the driver
+ * writes REG_FREQ_PERF_STATE (offset 0x88).  In the pre-handler we re-write
+ * CSRAM LUT voltages for entries that have active overrides OR are LUT[0]
+ * with an OC freq target.  The HW perf-controller then reads our voltage
+ * within nanoseconds, far too fast for MCUPM to overwrite again.
+ *
+ * Also patches LUT[0] voltage from cpu_oc_*_volt (the OC top-OPP voltage)
+ * so that even without per-LUT cpu_volt_override, the OC'd top-OPP gets the
+ * correct voltage on every transition.
+ */
+static void __nocfi cpu_csram_resync_fast(void)
+{
+	int c;
+
+	if (!csram_base)
+		return;
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int dom_base = domain_offsets[c];
+		unsigned int target_khz = READ_ONCE(cpu_oc_targets[c]);
+		int i;
+
+		/* Re-patch LUT[0] with OC freq + voltage if active */
+		if (target_khz > 0) {
+			static unsigned int * const tgt_volts[] = {
+				&cpu_oc_l_volt, &cpu_oc_b_volt, &cpu_oc_p_volt
+			};
+			unsigned int oc_volt_uv = READ_ONCE(*tgt_volts[c]);
+			if (oc_volt_uv > 0) {
+				u32 cur = readl_relaxed(csram_base + dom_base +
+						       REG_FREQ_LUT);
+				u32 want = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+					   ((oc_volt_uv / 10) << 12);
+				if (cur != want)
+					writel_relaxed(want, csram_base + dom_base +
+						       REG_FREQ_LUT);
+			}
+		}
+
+		/* Re-patch per-LUT voltage overrides */
+		if (cpu_volt_ov_count > 0) {
+			for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+				unsigned int ov = cpu_volt_ov[c][i];
+				u32 cur, patched;
+
+				if (!ov)
+					continue;
+
+				cur = readl_relaxed(csram_base + dom_base +
+						    REG_FREQ_LUT +
+						    i * LUT_ROW_SIZE);
+				patched = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+					  ((ov / 10) << 12);
+				if (cur != patched)
+					writel_relaxed(patched, csram_base +
+						       dom_base + REG_FREQ_LUT +
+						       i * LUT_ROW_SIZE);
+			}
+		}
+	}
+
+	/* No wmb() — writel_relaxed ordering is sufficient; the HW read
+	 * follows the REG_FREQ_PERF_STATE write which acts as a barrier.
+	 */
+}
+
+/*
+ * Kprobe pre-handler: fires immediately before mtk_cpufreq_hw writes
+ * REG_FREQ_PERF_STATE to trigger a DVFS transition.
+ * AArch64: x0 = struct cpufreq_policy *, x1 = target_freq (unsigned int)
+ */
+static int __nocfi cpufreq_hw_fast_switch_kp_pre(struct kprobe *p,
+						 struct pt_regs *regs)
+{
+	cpu_csram_resync_fast();
+	return 0;
+}
+
+static struct kprobe cpufreq_hw_fast_switch_kp = {
+	.symbol_name = "mtk_cpufreq_hw_fast_switch",
+	.pre_handler = cpufreq_hw_fast_switch_kp_pre,
+};
+
+/*
+ * Same for the non-fast-switch path (target_index).
+ * AArch64: x0 = struct cpufreq_policy *, x1 = index (unsigned int)
+ */
+static int __nocfi cpufreq_hw_target_index_kp_pre(struct kprobe *p,
+						  struct pt_regs *regs)
+{
+	cpu_csram_resync_fast();
+	return 0;
+}
+
+static struct kprobe cpufreq_hw_target_index_kp = {
+	.symbol_name = "mtk_cpufreq_hw_target_index",
+	.pre_handler = cpufreq_hw_target_index_kp_pre,
+};
+
+static void cpu_reapply_volt_overrides_locked(void)
+{
+	int c;
+
+	if (cpu_volt_ov_count <= 0 || !csram_base)
+		return;
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int dom_base = domain_offsets[c];
+		int i;
+
+		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			unsigned int ov = cpu_volt_ov[c][i];
+			u32 cur, patched;
+
+			if (!ov)
+				continue;
+
+			cur = readl_relaxed(csram_base + dom_base +
+					    REG_FREQ_LUT + i * LUT_ROW_SIZE);
+			patched = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+				  ((ov / 10) << 12);
+			if (cur != patched)
+				writel_relaxed(patched, csram_base + dom_base +
+					       REG_FREQ_LUT + i * LUT_ROW_SIZE);
+		}
+	}
+
+	wmb();
+}
+
 /* ─── Periodic freq_qos re-lift worker ──────────────────────────────────── */
 /*
  * Vendor modules (powerhal, fpsgo, mtk_cpu_power_throttling) periodically
@@ -733,6 +887,9 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 	}
 
 	(void)any_lifted;
+
+	/* Safety net: event-driven sync handles transitions, this catches misses. */
+	cpu_reapply_volt_overrides_locked();
 
 	if (cpu_oc_relift_active)
 		schedule_delayed_work(&cpu_oc_relift_dwork,
@@ -878,7 +1035,7 @@ static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
 	freq = tbl[0];
 	volt = tbl[1];
 	vsram = tbl[2];
-	if (freq < 1000000 || freq > 2000000) {
+	if (freq < 1000000 || freq > 4000000) {
 		pr_warn("KPM_OC: %s[0] unexpected freq=%u, skip\n", name, freq);
 		return 0;
 	}
@@ -1013,10 +1170,91 @@ static void __nocfi gpu_oc_diagnostic(void)
 	}
 }
 
+/* ─── GPUEB countermeasure: event-driven GPU OPP resync ─────────────────
+ *
+ * Root cause: GPUEB firmware owns the shared_status/working_table in shared
+ * memory and continuously overwrites OPP voltage fields (e.g. OPP[0].volt
+ * reverts to 40500 from our target 105000).  The g_gpu_default_opp_table in
+ * AP module .bss is also reverted — likely by a kernel path that synchronises
+ * from shared_status back to the default table.
+ *
+ * Fix: Kprobe on __gpufreq_generic_commit_gpu.  This is the main GPU DVFS
+ * commit function, called right before voltage/frequency scaling.  The
+ * pre-handler re-patches default_table and working_table so the commit reads
+ * our OC values.  Combined with the periodic kthread (reduced to safety-net
+ * role), this eliminates the GPUEB overwrite race.
+ */
+static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	unsigned int tgt_freq = READ_ONCE(gpu_target_freq);
+	unsigned int tgt_volt = READ_ONCE(gpu_target_volt);
+	unsigned int tgt_vsram = READ_ONCE(gpu_target_vsram);
+	u32 *tbl;
+	int i;
+
+	if (tgt_freq == 0)
+		return 0;
+
+	/* Re-patch default_opp_table[0] */
+	if (opp_table_anchor) {
+		tbl = (u32 *)opp_table_anchor;
+		if (tbl[0] == tgt_freq) {
+			tbl[1] = tgt_volt;
+			tbl[2] = tgt_vsram;
+		}
+		/* Per-OPP voltage overrides */
+		if (gpu_volt_ov_count > 0) {
+			for (i = 0; i < GPU_MAX_OPPS; i++) {
+				unsigned int ov = gpu_volt_ov[i];
+				unsigned int vs = gpu_vsram_ov[i];
+				u32 *e;
+				if (!ov && !vs)
+					continue;
+				e = tbl + i * (GPU_OPP_STRIDE / 4);
+				if (ov) e[1] = ov;
+				if (vs) e[2] = vs;
+			}
+		}
+	}
+
+	/* Re-patch working_table[0] (shared memory — GPUEB will overwrite,
+	 * but commit reads it before GPUEB can react) */
+	tbl = NULL;
+	if (fn_get_working_table_gpu)
+		tbl = fn_get_working_table_gpu();
+	if (!tbl && fn_get_working_table_wrap)
+		tbl = fn_get_working_table_wrap(0);
+	if (tbl && tbl[0] == tgt_freq) {
+		tbl[1] = tgt_volt;
+		tbl[2] = tgt_vsram;
+		/* Per-OPP overrides on working table */
+		if (gpu_volt_ov_count > 0) {
+			for (i = 0; i < GPU_MAX_OPPS; i++) {
+				unsigned int ov = gpu_volt_ov[i];
+				unsigned int vs = gpu_vsram_ov[i];
+				u32 *e;
+				if (!ov && !vs)
+					continue;
+				e = tbl + i * (GPU_OPP_STRIDE / 4);
+				if (ov) e[1] = ov;
+				if (vs) e[2] = vs;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static struct kprobe gpu_commit_kp = {
+	.symbol_name = "__gpufreq_generic_commit_gpu",
+	.pre_handler = gpu_commit_kp_pre,
+};
+
 /*
  * Kthread function: runs for the module lifetime and periodically re-applies
- * working/signed table patching.  This keeps GPU OC active even after GPU
- * power-cycle or vendor-side runtime table refresh.
+ * working/signed table patching.  With the gpu_commit_kp kprobe active, this
+ * acts primarily as a safety net for power-on/off transitions where GPUEB
+ * refreshes tables outside the commit path.
  */
 static int gpu_oc_kthread_fn(void *data)
 {
@@ -1093,7 +1331,7 @@ static int set_gpu_oc(const char *val, const struct kernel_param *kp)
 	orig_volt  = opp_entry[1];
 	orig_vsram = opp_entry[2];
 
-	if (orig_freq < 1000000 || orig_freq > 2000000) {
+	if (orig_freq < 1000000 || orig_freq > 4000000) {
 		pos = snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
 			       "FAIL:unexpected_freq=%u", orig_freq);
 		goto out;
@@ -1503,10 +1741,10 @@ static int __init kpm_oc_init(void)
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
 	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v7.0 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v7.2 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
-	/* Register kprobe to intercept freq_qos_update_request at call time */
+	/* Register kprobes for freq_qos and userlimit interception */
 	{
 		int kret = register_kprobe(&freq_qos_kp);
 
@@ -1525,6 +1763,42 @@ static int __init kpm_oc_init(void)
 				kret2);
 		else
 			pr_info("KPM_OC: update_userlimit_cpufreq_max kprobe registered\n");
+	}
+
+	/* MCUPM CSRAM countermeasure: kprobe on cpufreq-hw DVFS transitions
+	 * to re-patch LUT voltages immediately before HW reads them.
+	 */
+	{
+		int kret3 = register_kprobe(&cpufreq_hw_fast_switch_kp);
+
+		if (kret3 < 0)
+			pr_warn("KPM_OC: cpufreq_hw fast_switch kprobe failed (%d)\n",
+				kret3);
+		else
+			pr_info("KPM_OC: mtk_cpufreq_hw_fast_switch kprobe registered (MCUPM countermeasure)\n");
+	}
+
+	{
+		int kret4 = register_kprobe(&cpufreq_hw_target_index_kp);
+
+		if (kret4 < 0)
+			pr_warn("KPM_OC: cpufreq_hw target_index kprobe failed (%d)\n",
+				kret4);
+		else
+			pr_info("KPM_OC: mtk_cpufreq_hw_target_index kprobe registered (MCUPM countermeasure)\n");
+	}
+
+	/* GPUEB countermeasure: kprobe on GPU DVFS commit to re-patch OPP
+	 * voltages immediately before the commit reads them.
+	 */
+	{
+		int kret5 = register_kprobe(&gpu_commit_kp);
+
+		if (kret5 < 0)
+			pr_warn("KPM_OC: gpu_commit kprobe failed (%d)\n",
+				kret5);
+		else
+			pr_info("KPM_OC: __gpufreq_generic_commit_gpu kprobe registered (GPUEB countermeasure)\n");
 	}
 
 	/* Auto-scan CPU OPP on load */
@@ -1560,6 +1834,9 @@ static void __exit kpm_oc_exit(void)
 {
 	unregister_kprobe(&freq_qos_kp);
 	unregister_kprobe(&userlimit_kp);
+	unregister_kprobe(&cpufreq_hw_fast_switch_kp);
+	unregister_kprobe(&cpufreq_hw_target_index_kp);
+	unregister_kprobe(&gpu_commit_kp);
 	cpu_oc_relift_active = false;
 	cancel_delayed_work_sync(&cpu_oc_relift_dwork);
 	if (gpu_oc_task) {
@@ -1575,4 +1852,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v7.0");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v7.2");
