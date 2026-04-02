@@ -806,6 +806,16 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 		if (!policy)
 			continue;
 
+		/*
+		 * Keep cluster_qos_ptr fresh so the freq_qos_update_request
+		 * kprobe can identify which requests target this cluster.
+		 * This pointer may be NULL if set_cpu_oc() ran at early boot
+		 * before cpufreq policies were registered, which would leave
+		 * the kprobe unable to intercept vendor stock-cap writes
+		 * (powerhal, fpsgo, thermal) even after relift succeeds.
+		 */
+		WRITE_ONCE(cluster_qos_ptr[c], &policy->constraints);
+
 		agg_max = fn_freq_qos_read_value ?
 			fn_freq_qos_read_value(&policy->constraints,
 					       2 /* FREQ_QOS_MAX */) : (s32)target;
