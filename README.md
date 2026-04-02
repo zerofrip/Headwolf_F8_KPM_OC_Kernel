@@ -75,15 +75,18 @@ A 500 ms periodic relift cannot keep up with these firmware write-backs.
 
 ### Solution: Event-Driven Resync via kprobes
 
-Instead of polling, v7.2 installs kprobes that fire on the exact functions called during DVFS transitions:
+Instead of polling, v7.2 installs kprobes that fire on the exact functions called during DVFS transitions.
+All 5 kprobes are registered at module init:
 
 | kprobe symbol | Module | Purpose |
 |---------------|--------|---------|
+| `freq_qos_update_request` | core kernel | Intercept vendor freq_qos MAX lowering calls; silently raise argument to OC target so vendor constraints cannot clamp the OC ceiling |
+| `update_userlimit_cpufreq_max` | platform driver | Intercept powerhal / touch_boost calls that restore the stock CPU max; raise the argument to the OC target |
 | `mtk_cpufreq_hw_fast_switch` | `mediatek_cpufreq_hw` | Re-patch CSRAM LUT voltages before fast-switch path |
 | `mtk_cpufreq_hw_target_index` | `mediatek_cpufreq_hw` | Re-patch CSRAM LUT voltages before target-index path |
 | `__gpufreq_generic_commit_gpu` | `mtk_gpufreq_mt6897` | Re-patch GPU default + working OPP[0] before commit reads them |
 
-The pre-handler for each CPU kprobe calls `cpu_csram_resync_fast()`, which writes OC voltages to CSRAM for all clusters nanoseconds before the HW reads `REG_FREQ_PERF_STATE`. The GPU kprobe pre-handler re-patches `default_table[0]` and `working_table[0]` before `__gpufreq_generic_commit_gpu` dereferences them.
+The pre-handler for each CPU DVFS kprobe calls `cpu_csram_resync_fast()`, which writes OC voltages to CSRAM for all clusters nanoseconds before the HW reads `REG_FREQ_PERF_STATE`. The GPU kprobe pre-handler re-patches `default_table[0]` and `working_table[0]` before `__gpufreq_generic_commit_gpu` dereferences them.
 
 The 500 ms periodic relift worker is kept as a safety net for edge cases.
 
