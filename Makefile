@@ -1,7 +1,7 @@
 obj-m += kpm_oc.o
 
-# Set this to your GKI kernel source/headers path.
-# If building on a native Linux host for the current kernel:
+# Use build.sh for a guided build. Direct make invocation:
+#   make KERNEL_DIR=/path/to/android14-6.1/common ARCH=arm64 LLVM=1 LLVM_IAS=1 KBUILD_MODPOST_WARN=1 modules
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 

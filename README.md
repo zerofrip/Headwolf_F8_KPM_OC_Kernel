@@ -202,14 +202,47 @@ Overrides are persisted by the GPU relift kthread (500 ms interval), so they sur
 
 ## Building
 
-Requires GKI kernel source/headers for Android 14 (kernel 6.1) and LLVM/Clang toolchain:
+Requires Android GKI kernel source (`android14-6.1` branch) and Android Clang r487747c (17.0.2).
+This device has `CONFIG_CFI_CLANG=y`; other Clang versions may cause a CFI failure at `insmod`.
+
+### Recommended: `build.sh`
 
 ```bash
-make KERNEL_DIR=/path/to/android14-6.1/common \
-     ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc)
+./build.sh \
+  KERNEL_DIR=/path/to/android14-6.1/common \
+  CLANG_DIR=/path/to/clang-r487747c
 ```
 
-> **Note:** `Module.symvers` is absent in the GKI tree, so `modpost` emits unresolved symbol warnings. These are expected — the symbols are resolved at runtime on the device.
+`build.sh` validates the environment, sets PATH, and prints the `vermagic` of the resulting `.ko`.
+It also accepts env-var form: `KERNEL_DIR=... CLANG_DIR=... ./build.sh`
+
+### Kernel source preparation (one-time)
+
+The GKI source tree must be configured and prepared before any out-of-tree module build:
+
+```bash
+cd /path/to/android14-6.1/common
+PATH=/path/to/clang-r487747c/bin:$PATH \
+make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+
+PATH=/path/to/clang-r487747c/bin:$PATH \
+make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) scripts prepare modules_prepare
+```
+
+### Direct `make` invocation
+
+```bash
+PATH=/path/to/clang-r487747c/bin:$PATH \
+make KERNEL_DIR=/path/to/android14-6.1/common \
+     ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+     KBUILD_MODPOST_WARN=1 \
+     -j$(nproc) modules
+```
+
+> **Note:** `KBUILD_MODPOST_WARN=1` is required because `Module.symvers` is absent in the GKI tree,
+> causing `modpost` to emit unresolved symbol warnings. These are expected — symbols are resolved at
+> runtime by the device kernel. APatch's KPM loader bypasses modversion CRC checks, so this has no
+> runtime effect.
 
 ## Usage
 

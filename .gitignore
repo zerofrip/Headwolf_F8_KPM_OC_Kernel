@@ -1,6 +1,5 @@
-# Build artifacts
+# Build artifacts — keep the release binary (kpm_oc.ko) tracked
 *.o
-*.ko
 *.mod
 *.mod.c
 *.order
@@ -14,3 +13,4 @@ Module.symvers
 *.swp
 *~
 .vscode/
+kpm_oc.ko
