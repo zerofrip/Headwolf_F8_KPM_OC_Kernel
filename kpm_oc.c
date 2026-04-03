@@ -2212,6 +2212,7 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 	unsigned int tgt_vsram = READ_ONCE(gpu_target_vsram);
 	u32 *tbl;
 	int i;
+	static unsigned long last_log_jiffies;
 
 	if (tgt_freq == 0)
 		return 0;
@@ -2268,6 +2269,24 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 				if (vs) WRITE_ONCE(e[2], vs);
 			}
 		}
+	}
+
+	/* Rate-limited diagnostic: log pre-patch state + arg (oppidx) */
+	if (time_after(jiffies, last_log_jiffies + msecs_to_jiffies(2000))) {
+		u32 wt_freq = 0;
+		u32 def_freq = 0;
+		if (opp_table_anchor)
+			def_freq = READ_ONCE(((u32 *)opp_table_anchor)[0]);
+		tbl = NULL;
+		if (fn_get_working_table_gpu)
+			tbl = fn_get_working_table_gpu();
+		if (!tbl && fn_get_working_table_wrap)
+			tbl = fn_get_working_table_wrap(0);
+		if (tbl)
+			wt_freq = READ_ONCE(tbl[0]);
+		pr_info("KPM_OC: gpu_commit_kp: oppidx=%u def[0]=%u wt[0]=%u tgt=%u\n",
+			(unsigned int)regs->regs[0], def_freq, wt_freq, tgt_freq);
+		last_log_jiffies = jiffies;
 	}
 
 	return 0;
