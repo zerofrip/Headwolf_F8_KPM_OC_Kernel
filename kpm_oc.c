@@ -61,6 +61,66 @@ static const int cluster_policies[] = { 0, 4, 7 };
 static const char * const cluster_names[] = { "L", "B", "P" };
 #define NUM_CLUSTERS      3
 
+/* ─── ARMPLL Direct Access Configuration ─────────────────────────────── */
+/*
+ * Bypass MCUPM firmware by writing ARMPLL PLL registers directly from AP.
+ * On MT6897 with scmi_cpufreq, MCUPM controls actual PLL frequency via its
+ * own frequency table.  CSRAM LUT patching only changes kernel metadata.
+ * This section directly programs ARMPLL PCW (phase-controlled word) registers
+ * to achieve real hardware overclocking.
+ *
+ * From DTB fhctl node — MCU PLL subsystem at 0x0C030000:
+ *   ccipll:    base+0x000, FHCTL base+0x100
+ *   armpll_ll: base+0x400, FHCTL base+0x500  (L cluster, policy0)
+ *   armpll_bl: base+0x800, FHCTL base+0x900  (B cluster, policy4)
+ *   armpll_b:  base+0xC00, FHCTL base+0xD00  (P cluster, policy7)
+ *
+ * PLL frequency formula:
+ *   freq_hz = FIN × PCW / 2^PCW_FRAC_BITS / POSTDIV
+ *   where FIN = 26 MHz, PCW_FRAC_BITS = 14, POSTDIV = 2^postdiv_pow
+ *
+ * PLL_CON1 register layout:
+ *   bits[21:0]  = PCW (DDS value)
+ *   bits[26:24] = POSTDIV power (0=÷1, 1=÷2, 2=÷4, ...)
+ *
+ * WARNING: Direct PLL manipulation bypasses MCUPM DVFS.  Voltage is NOT
+ * adjusted here — the CPU runs at whatever voltage MCUPM last set for the
+ * stock frequency.  Overclocking without voltage increase risks instability.
+ */
+#define MCU_PLL_PHYS_BASE    0x0C030000UL
+#define MCU_PLL_PHYS_SIZE    0x00005000UL  /* 20KB: ccipll through ptppll */
+
+/* Per-cluster ARMPLL offset from MCU_PLL_PHYS_BASE */
+static const unsigned int pll_offsets[] = { 0x400, 0x800, 0xC00 }; /* L, B, P */
+
+/* PLL CON register offsets from per-PLL base */
+#define PLL_CON0             0x00
+#define PLL_CON1             0x04  /* PCW[21:0] + POSTDIV[26:24] */
+#define PLL_CON2             0x08
+#define PLL_CON3             0x0C
+
+/* FHCTL (frequency hopping controller) register offsets
+ * MT6897-specific: from fhctl.ko mt6897_mcu*_offset tables [0x14,0x0C,0x08,0x10,0x04]
+ */
+#define FHCTL_OFF            0x100  /* FHCTL base = PLL base + 0x100 */
+#define REG_FHCTL_CFG        0x14   /* per-PLL FHCTL config */
+#define REG_FHCTL_UPDNLMT   0x0C   /* up/down limit */
+#define REG_FHCTL_DDS        0x08   /* center DDS (SSC base) */
+#define REG_FHCTL_DVFS       0x10   /* DVFS target DDS */
+#define REG_FHCTL_MON        0x04   /* PLL DDS monitor (current) */
+
+/* PLL / FHCTL bit masks */
+#define PLL_DDS_MASK         0x003FFFFFUL  /* PCW: bits[21:0] */
+#define PLL_POSTDIV_MASK     0x07000000UL  /* bits[26:24] */
+#define PLL_POSTDIV_SHIFT    24
+#define FHCTL_DDS_VALID      BIT(31)
+#define FHCTL_SFSTR_EN       BIT(2)  /* soft-start (DVFS) enable */
+#define FHCTL_FHCTL_EN       BIT(0)  /* frequency hopping enable */
+
+#define PLL_FIN_MHZ          26
+#define PLL_PCW_FRAC_BITS    14
+
+
 /*
  * mtk-cpufreq-hw register offsets within each domain:
  *   REG_FREQ_LUT_TABLE = 0x00   (frequency LUT)
@@ -269,6 +329,9 @@ static struct freq_constraints *cluster_qos_ptr[NUM_CLUSTERS];
 
 static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work);
 
+/* ─── PLL Direct Access state (read-only diagnostics) ─── */
+static void __iomem *mcu_pll_base;
+
 /* Forward declarations for CPU voltage override (defined after GPU section) */
 static unsigned int cpu_volt_ov[NUM_CLUSTERS][LUT_MAX_ENTRIES];
 static int          cpu_volt_ov_count;
@@ -337,6 +400,696 @@ static char cpu_oc_result[CPU_RESULT_BUF_SIZE];
 module_param_string(cpu_oc_result, cpu_oc_result, sizeof(cpu_oc_result), 0444);
 MODULE_PARM_DESC(cpu_oc_result, "Result of last CPU OC patch (read-only)");
 
+/* ─── PLL Direct Access Functions ───────────────────────────────────────── */
+
+/* Calculate PCW (DDS) for a target frequency in MHz.
+ * Formula: PCW = freq_mhz × 2^PCW_FRAC_BITS / FIN
+ *          freq = FIN × PCW / 2^PCW_FRAC_BITS / POSTDIV
+ * Assumes POSTDIV = 1 (appropriate for frequencies > 1.5 GHz).
+ */
+static u32 freq_to_dds(unsigned int freq_mhz)
+{
+	return (u32)((u64)freq_mhz * (1U << PLL_PCW_FRAC_BITS) / PLL_FIN_MHZ)
+	       & PLL_DDS_MASK;
+}
+
+/* Convert PLL CON1 register value back to frequency in MHz */
+static unsigned int con1_to_freq_mhz(u32 con1)
+{
+	u32 pcw = con1 & PLL_DDS_MASK;
+	unsigned int postdiv_pow = (con1 & PLL_POSTDIV_MASK) >> PLL_POSTDIV_SHIFT;
+	unsigned int postdiv = 1U << postdiv_pow;
+
+	if (postdiv == 0)
+		postdiv = 1;
+	return (unsigned int)((u64)PLL_FIN_MHZ * pcw / (1U << PLL_PCW_FRAC_BITS)
+			      / postdiv);
+}
+
+/* ─── PLL Register Dump (diagnostic, read-only) ─────────────────────────── */
+
+#define PLL_DUMP_BUF_SIZE 2048
+static char pll_dump_buf[PLL_DUMP_BUF_SIZE];
+module_param_string(pll_dump, pll_dump_buf, sizeof(pll_dump_buf), 0444);
+MODULE_PARM_DESC(pll_dump, "PLL register dump (read-only)");
+
+static int set_pll_dump(const char *val, const struct kernel_param *kp)
+{
+	int c, pos = 0;
+
+	memset(pll_dump_buf, 0, sizeof(pll_dump_buf));
+
+	if (!mcu_pll_base) {
+		snprintf(pll_dump_buf, PLL_DUMP_BUF_SIZE, "NOT_MAPPED");
+		return 0;
+	}
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		void __iomem *pll = mcu_pll_base + pll_offsets[c];
+		void __iomem *fh = pll + FHCTL_OFF;
+		u32 con0 = readl(pll + PLL_CON0);
+		u32 con1 = readl(pll + PLL_CON1);
+		u32 con2 = readl(pll + PLL_CON2);
+		u32 con3 = readl(pll + PLL_CON3);
+		u32 fh_cfg = readl(fh + REG_FHCTL_CFG);
+		u32 fh_dds = readl(fh + REG_FHCTL_DDS);
+		u32 fh_dvfs = readl(fh + REG_FHCTL_DVFS);
+		u32 fh_mon = readl(fh + REG_FHCTL_MON);
+		u32 fh_updnlmt = readl(fh + REG_FHCTL_UPDNLMT);
+		unsigned int freq_mhz = con1_to_freq_mhz(con1);
+		unsigned int mon_freq = con1_to_freq_mhz(fh_mon);
+
+		pos += snprintf(pll_dump_buf + pos, PLL_DUMP_BUF_SIZE - pos,
+				"[%s@0x%03x] CON0=%08x CON1=%08x(%uMHz) "
+				"CON2=%08x CON3=%08x "
+				"FH:CFG=%08x DDS=%08x DVFS=%08x MON=%08x(%uMHz) "
+				"UPD=%08x | ",
+				cluster_names[c], pll_offsets[c],
+				con0, con1, freq_mhz,
+				con2, con3,
+				fh_cfg, fh_dds, fh_dvfs, fh_mon, mon_freq,
+				fh_updnlmt);
+	}
+
+	/* Also dump raw words at PLL base for first cluster to find real regs */
+	{
+		void __iomem *base = mcu_pll_base + pll_offsets[2]; /* P cluster */
+		int i;
+
+		pos += snprintf(pll_dump_buf + pos, PLL_DUMP_BUF_SIZE - pos,
+				"[P raw 0x00-0x3C] ");
+		for (i = 0; i < 16 && pos < PLL_DUMP_BUF_SIZE - 12; i++)
+			pos += snprintf(pll_dump_buf + pos,
+					PLL_DUMP_BUF_SIZE - pos, "%08x ",
+					readl(base + i * 4));
+	}
+
+	pr_info("KPM_OC: PLL dump: %s\n", pll_dump_buf);
+	return 0;
+}
+
+static const struct kernel_param_ops pll_dump_ops = { .set = set_pll_dump };
+static int pll_dump_dummy;
+module_param_cb(pll_scan, &pll_dump_ops, &pll_dump_dummy, 0220);
+MODULE_PARM_DESC(pll_scan, "Write 1 to dump PLL registers");
+
+/* ─── MCUPM SRAM Frequency Table Scanner ────────────────────────────────── */
+/*
+ * MCUPM firmware has its own frequency table in SRAM (0x0C070000, 320KB).
+ * The encrypted firmware is decrypted at boot; runtime SRAM contains the live
+ * data including DDS/PCW tables that MCUPM uses for DVFS.
+ *
+ * We search for known stock max DDS values to locate the table, then patch
+ * with OC target DDS values.
+ */
+#define MCUPM_SRAM_PHYS_BASE 0x0C070000UL
+#define MCUPM_SRAM_PHYS_SIZE 0x00050000UL  /* 320KB */
+#define MCUPM_DRAM_PHYS_BASE 0x7FD00000UL  /* MCUPM reserved DRAM */
+#define MCUPM_DRAM_PHYS_SIZE 0x00100000UL  /* 1MB */
+
+static void __iomem *mcupm_sram_base;
+static void __iomem *mcupm_dram_base;
+
+/* Known stock max frequencies (MHz) -> expected DDS values at POSTDIV=1 */
+static const struct {
+	const char *name;
+	unsigned int freq_mhz;
+	u32 dds;  /* PCW = freq * 2^14 / 26 */
+} stock_freq_table[] = {
+	{ "P-max", 3350, 0 },  /* filled at runtime */
+	{ "B-max", 3200, 0 },
+	{ "L-max", 2200, 0 },
+};
+
+#define MCUPM_SCAN_BUF_SIZE 4096
+static char mcupm_scan_buf[MCUPM_SCAN_BUF_SIZE];
+module_param_string(mcupm_scan, mcupm_scan_buf, sizeof(mcupm_scan_buf), 0444);
+MODULE_PARM_DESC(mcupm_scan, "MCUPM SRAM scan results (read-only)");
+
+static int set_mcupm_scan(const char *val, const struct kernel_param *kp)
+{
+	int pos = 0;
+	u32 i;
+	u32 sram_words;
+	u32 dds_p, dds_b, dds_l;
+
+	memset(mcupm_scan_buf, 0, sizeof(mcupm_scan_buf));
+
+	if (!mcupm_sram_base) {
+		snprintf(mcupm_scan_buf, MCUPM_SCAN_BUF_SIZE, "NOT_MAPPED");
+		return 0;
+	}
+
+	/* Expected DDS values for stock max frequencies */
+	dds_p = freq_to_dds(3350); /* P cluster: 3350 MHz */
+	dds_b = freq_to_dds(3200); /* B cluster: 3200 MHz */
+	dds_l = freq_to_dds(2200); /* L cluster: 2200 MHz */
+
+	pos += snprintf(mcupm_scan_buf + pos, MCUPM_SCAN_BUF_SIZE - pos,
+			"search: P=%uMHz(0x%06x) B=%uMHz(0x%06x) L=%uMHz(0x%06x) | ",
+			3350, dds_p, 3200, dds_b, 2200, dds_l);
+
+	sram_words = MCUPM_SRAM_PHYS_SIZE / 4;
+
+	/* Hex dump first 32 words of SRAM */
+	pos += snprintf(mcupm_scan_buf + pos, MCUPM_SCAN_BUF_SIZE - pos,
+			"SRAM[0x00-0x7C]: ");
+	for (i = 0; i < 32 && pos < MCUPM_SCAN_BUF_SIZE - 12; i++) {
+		u32 w = readl(mcupm_sram_base + i * 4);
+		pos += snprintf(mcupm_scan_buf + pos,
+				MCUPM_SCAN_BUF_SIZE - pos, "%08x ", w);
+	}
+	pos += snprintf(mcupm_scan_buf + pos, MCUPM_SCAN_BUF_SIZE - pos, "| ");
+
+	/* Count non-zero words and show stats */
+	{
+		u32 nonzero = 0;
+		u32 first_nz_off = 0xFFFFFFFF;
+		for (i = 0; i < sram_words; i++) {
+			u32 w = readl(mcupm_sram_base + i * 4);
+			if (w != 0) {
+				nonzero++;
+				if (first_nz_off == 0xFFFFFFFF)
+					first_nz_off = i * 4;
+			}
+		}
+		pos += snprintf(mcupm_scan_buf + pos, MCUPM_SCAN_BUF_SIZE - pos,
+				"nonzero=%u/%u first@0x%x | ",
+				nonzero, sram_words, first_nz_off);
+	}
+
+	/* Search for DDS values (22-bit PCW in any word) */
+	for (i = 0; i < sram_words && pos < MCUPM_SCAN_BUF_SIZE - 80; i++) {
+		u32 w = readl(mcupm_sram_base + i * 4);
+		u32 masked = w & PLL_DDS_MASK;
+
+		if (masked == dds_p || masked == dds_b || masked == dds_l) {
+			const char *which = (masked == dds_p) ? "P" :
+					    (masked == dds_b) ? "B" : "L";
+			pos += snprintf(mcupm_scan_buf + pos,
+					MCUPM_SCAN_BUF_SIZE - pos,
+					"DDS:%s@0x%05x=0x%08x ", which, i * 4, w);
+		}
+
+		/* Also search for MHz values (small integers 2000-4000) */
+		if ((w >= 2000 && w <= 4000) &&
+		    (w == 3350 || w == 3200 || w == 2200 ||
+		     w == 2000 || w == 2600 || w == 2800 || w == 3000)) {
+			pos += snprintf(mcupm_scan_buf + pos,
+					MCUPM_SCAN_BUF_SIZE - pos,
+					"MHz:%u@0x%05x ", w, i * 4);
+		}
+
+		/* Search for KHz values */
+		if (w == 3350000 || w == 3200000 || w == 2200000 ||
+		    w == 3000000 || w == 2800000 || w == 2600000) {
+			pos += snprintf(mcupm_scan_buf + pos,
+					MCUPM_SCAN_BUF_SIZE - pos,
+					"KHz:%u@0x%05x ", w, i * 4);
+		}
+	}
+
+	if (pos == 0)
+		snprintf(mcupm_scan_buf, MCUPM_SCAN_BUF_SIZE,
+			 "NO_MATCHES in %u words", sram_words);
+
+	/* Also scan MCUPM reserved DRAM (0x7FD00000, 1MB) */
+	if (mcupm_dram_base) {
+		u32 dram_words = MCUPM_DRAM_PHYS_SIZE / 4;
+		u32 dram_nonzero = 0;
+
+		pos += snprintf(mcupm_scan_buf + pos, MCUPM_SCAN_BUF_SIZE - pos,
+				"DRAM: ");
+
+		for (i = 0; i < dram_words && pos < MCUPM_SCAN_BUF_SIZE - 80; i++) {
+			u32 w = readl(mcupm_dram_base + i * 4);
+			u32 masked = w & PLL_DDS_MASK;
+
+			if (w != 0)
+				dram_nonzero++;
+
+			if (masked == dds_p || masked == dds_b || masked == dds_l) {
+				const char *which = (masked == dds_p) ? "P" :
+						    (masked == dds_b) ? "B" : "L";
+				pos += snprintf(mcupm_scan_buf + pos,
+						MCUPM_SCAN_BUF_SIZE - pos,
+						"DDS:%s@D+0x%05x=0x%08x ",
+						which, i * 4, w);
+			}
+
+			/* MHz values */
+			if (w == 3350 || w == 3200 || w == 2200 ||
+			    w == 3000 || w == 2800 || w == 2600 || w == 2000)
+				pos += snprintf(mcupm_scan_buf + pos,
+						MCUPM_SCAN_BUF_SIZE - pos,
+						"MHz:%u@D+0x%05x ", w, i * 4);
+
+			/* KHz values */
+			if (w == 3350000 || w == 3200000 || w == 2200000 ||
+			    w == 3000000 || w == 2800000 || w == 2600000 ||
+			    w == 2000000 || w == 1800000 || w == 1500000)
+				pos += snprintf(mcupm_scan_buf + pos,
+						MCUPM_SCAN_BUF_SIZE - pos,
+						"KHz:%u@D+0x%05x ", w, i * 4);
+
+			/* 10KHz values */
+			if (w == 335000 || w == 320000 || w == 220000 ||
+			    w == 300000 || w == 280000 || w == 260000)
+				pos += snprintf(mcupm_scan_buf + pos,
+						MCUPM_SCAN_BUF_SIZE - pos,
+						"10K:%u@D+0x%05x ", w, i * 4);
+		}
+
+		pos += snprintf(mcupm_scan_buf + pos, MCUPM_SCAN_BUF_SIZE - pos,
+				"dram_nz=%u/%u | ", dram_nonzero, dram_words);
+	}
+
+	pr_info("KPM_OC: MCUPM scan: %s\n", mcupm_scan_buf);
+	return 0;
+}
+
+static const struct kernel_param_ops mcupm_scan_ops = { .set = set_mcupm_scan };
+static int mcupm_scan_dummy;
+module_param_cb(mcupm_scan_trigger, &mcupm_scan_ops, &mcupm_scan_dummy, 0220);
+MODULE_PARM_DESC(mcupm_scan_trigger, "Write 1 to scan MCUPM SRAM for freq tables");
+
+/* Hexdump a region of MCUPM DRAM: write "offset" to trigger,
+ * reads 256 bytes at that offset within DRAM region.
+ */
+#define MCUPM_HEX_BUF_SIZE 2048
+static char mcupm_hex_buf[MCUPM_HEX_BUF_SIZE];
+module_param_string(mcupm_hex, mcupm_hex_buf, sizeof(mcupm_hex_buf), 0444);
+MODULE_PARM_DESC(mcupm_hex, "MCUPM DRAM hex dump at given offset (read-only)");
+
+static int set_mcupm_hexdump(const char *val, const struct kernel_param *kp)
+{
+	unsigned long offset = 0;
+	int pos = 0, i;
+	void __iomem *base;
+	unsigned long max_size;
+
+	memset(mcupm_hex_buf, 0, sizeof(mcupm_hex_buf));
+
+	if (kstrtoul(val, 0, &offset))
+		return -EINVAL;
+
+	/* Auto-select SRAM or DRAM based on offset */
+	if (offset < MCUPM_SRAM_PHYS_SIZE && mcupm_sram_base) {
+		base = mcupm_sram_base;
+		max_size = MCUPM_SRAM_PHYS_SIZE;
+		pos += snprintf(mcupm_hex_buf + pos, MCUPM_HEX_BUF_SIZE - pos,
+				"SRAM+0x%lx: ", offset);
+	} else if (mcupm_dram_base) {
+		if (offset >= MCUPM_SRAM_PHYS_SIZE)
+			offset -= MCUPM_SRAM_PHYS_SIZE; /* allow absolute-ish offsets */
+		base = mcupm_dram_base;
+		max_size = MCUPM_DRAM_PHYS_SIZE;
+		pos += snprintf(mcupm_hex_buf + pos, MCUPM_HEX_BUF_SIZE - pos,
+				"DRAM+0x%lx: ", offset);
+	} else {
+		snprintf(mcupm_hex_buf, MCUPM_HEX_BUF_SIZE, "NOT_MAPPED");
+		return 0;
+	}
+
+	if (offset >= max_size) {
+		snprintf(mcupm_hex_buf, MCUPM_HEX_BUF_SIZE, "OUT_OF_RANGE");
+		return 0;
+	}
+
+	/* Dump 64 words (256 bytes) as hex */
+	for (i = 0; i < 64 && (offset + i * 4) < max_size &&
+	     pos < MCUPM_HEX_BUF_SIZE - 12; i++) {
+		u32 w = readl(base + offset + i * 4);
+		pos += snprintf(mcupm_hex_buf + pos,
+				MCUPM_HEX_BUF_SIZE - pos, "%08x ", w);
+	}
+
+	return 0;
+}
+
+static const struct kernel_param_ops mcupm_hex_ops = { .set = set_mcupm_hexdump };
+static int mcupm_hex_dummy;
+module_param_cb(mcupm_hexdump, &mcupm_hex_ops, &mcupm_hex_dummy, 0220);
+MODULE_PARM_DESC(mcupm_hexdump, "Hex dump MCUPM memory: write offset, read mcupm_hex");
+
+/* MCUPM DRAM write: "offset,value_hex" (offset within DRAM region) */
+#define MCUPM_WRITE_BUF_SIZE 256
+static char mcupm_write_buf[MCUPM_WRITE_BUF_SIZE];
+module_param_string(mcupm_write_result, mcupm_write_buf, sizeof(mcupm_write_buf), 0444);
+
+static int set_mcupm_write(const char *val, const struct kernel_param *kp)
+{
+	unsigned long offset = 0, value = 0;
+	char tmp[64], *comma;
+	u32 old_val;
+
+	memset(mcupm_write_buf, 0, sizeof(mcupm_write_buf));
+
+	if (!mcupm_dram_base) {
+		snprintf(mcupm_write_buf, MCUPM_WRITE_BUF_SIZE, "ERR: DRAM not mapped");
+		return -ENODEV;
+	}
+
+	strscpy(tmp, val, sizeof(tmp));
+	comma = strchr(tmp, ',');
+	if (!comma) {
+		snprintf(mcupm_write_buf, MCUPM_WRITE_BUF_SIZE, "ERR: format offset,value");
+		return -EINVAL;
+	}
+	*comma = '\0';
+	if (kstrtoul(tmp, 0, &offset) || kstrtoul(comma + 1, 0, &value))
+		return -EINVAL;
+
+	if (offset >= MCUPM_DRAM_PHYS_SIZE || (offset & 3)) {
+		snprintf(mcupm_write_buf, MCUPM_WRITE_BUF_SIZE,
+			 "ERR: offset 0x%lx out of range or unaligned", offset);
+		return -EINVAL;
+	}
+
+	old_val = readl(mcupm_dram_base + offset);
+	writel((u32)value, mcupm_dram_base + offset);
+
+	snprintf(mcupm_write_buf, MCUPM_WRITE_BUF_SIZE,
+		 "DRAM+0x%lx: 0x%08x → 0x%08lx",
+		 offset, old_val, value);
+
+	pr_info("KPM_OC: DRAM write: offset=0x%lx old=0x%08x new=0x%08lx\n",
+		offset, old_val, value);
+	return 0;
+}
+
+static const struct kernel_param_ops mcupm_write_ops = { .set = set_mcupm_write };
+static int mcupm_write_dummy;
+module_param_cb(mcupm_dram_write, &mcupm_write_ops, &mcupm_write_dummy, 0220);
+MODULE_PARM_DESC(mcupm_dram_write, "Write DRAM: offset,value_hex");
+
+/* ─── Kernel virtual memory reader ──────────────────────────────────────── */
+/*
+ * Read 64 words (256 bytes) at a kernel virtual address.
+ * Write hex address to kvm_read_trigger, read result from kvm_read.
+ * Uses copy_from_kernel_nofault for safe access.
+ */
+#define KVM_READ_BUF_SIZE 2048
+static char kvm_read_buf[KVM_READ_BUF_SIZE];
+module_param_string(kvm_read, kvm_read_buf, sizeof(kvm_read_buf), 0444);
+MODULE_PARM_DESC(kvm_read, "Kernel virtual memory read result (read-only)");
+
+static int set_kvm_read(const char *val, const struct kernel_param *kp)
+{
+	unsigned long addr = 0;
+	int pos = 0, i;
+
+	memset(kvm_read_buf, 0, sizeof(kvm_read_buf));
+
+	if (kstrtoul(val, 0, &addr))
+		return -EINVAL;
+
+	if (addr < PAGE_OFFSET) {
+		snprintf(kvm_read_buf, KVM_READ_BUF_SIZE, "ERR: addr 0x%lx below PAGE_OFFSET", addr);
+		return -EINVAL;
+	}
+
+	pos += snprintf(kvm_read_buf + pos, KVM_READ_BUF_SIZE - pos,
+			"@%lx: ", addr);
+
+	for (i = 0; i < 64 && pos < KVM_READ_BUF_SIZE - 12; i++) {
+		u32 w;
+
+		if (copy_from_kernel_nofault(&w, (void *)(addr + i * 4), 4)) {
+			pos += snprintf(kvm_read_buf + pos,
+					KVM_READ_BUF_SIZE - pos, "FAULT ");
+			break;
+		}
+		pos += snprintf(kvm_read_buf + pos,
+				KVM_READ_BUF_SIZE - pos, "%08x ", w);
+	}
+
+	return 0;
+}
+
+static const struct kernel_param_ops kvm_read_ops = { .set = set_kvm_read };
+static int kvm_read_dummy;
+module_param_cb(kvm_read_trigger, &kvm_read_ops, &kvm_read_dummy, 0220);
+MODULE_PARM_DESC(kvm_read_trigger, "Read 256 bytes at kernel virtual address");
+
+/* ─── fhctl hopping function caller ─────────────────────────────────────── */
+/*
+ * Call fhctl's mcupm_hopping_v1 to send DDS to MCUPM via IPI.
+ * MCUPM will program the PLL using its privileged register access.
+ *
+ * From fhctl.ko disassembly, _array holds per-PLL data with ioremapped
+ * register pointers and hopping function pointers.
+ */
+/*
+ * mcupm_hopping_v1 actual signature (from disassembly):
+ *   int mcupm_hopping_v1(void *pll_data, const char *domain_name,
+ *                        int fh_id, unsigned int new_dds, int postdiv)
+ * x0=pll_data, x1=domain, w2=fh_id, w3=new_dds, w4=postdiv
+ * The function looks up domain_name in its internal name_table to compute
+ * the MCUPM-internal fh_id, then sends IPI with cmd=0x1006.
+ */
+typedef int (*fhctl_hopping5_t)(void *pll_data, const char *domain,
+			       int fh_id, unsigned int new_dds, int postdiv);
+static fhctl_hopping5_t fn_mcupm_hopping;
+static fhctl_hopping5_t fn_ap_hopping;
+static unsigned long fhctl_array_sym; /* &_array in fhctl.ko */
+
+/* Cached per-PLL data pointers for MCU PLLs (L, B, P) in _array */
+static void *mcu_pll_data[NUM_CLUSTERS] __maybe_unused; /* from _array: per-domain pll_data */
+
+static void resolve_fhctl_symbols(void)
+{
+	if (!kln_func)
+		return;
+	if (!fn_mcupm_hopping)
+		fn_mcupm_hopping = (fhctl_hopping5_t)kln_func("mcupm_hopping_v1");
+	if (!fn_ap_hopping)
+		fn_ap_hopping = (fhctl_hopping5_t)kln_func("ap_hopping_v1");
+	if (!fhctl_array_sym)
+		fhctl_array_sym = kln_func("_array");
+}
+
+/* Diagnostic: dump fhctl _array contents */
+#define FHCTL_DIAG_BUF_SIZE 2048
+static char fhctl_diag_buf[FHCTL_DIAG_BUF_SIZE];
+module_param_string(fhctl_diag, fhctl_diag_buf, sizeof(fhctl_diag_buf), 0444);
+MODULE_PARM_DESC(fhctl_diag, "fhctl internal state dump (read-only)");
+
+/*
+ * fhctl _array per-PLL data layout (reverse-engineered from mcupm_init_v1):
+ *   struct fhctl_pll_data {
+ *     void *domain_data;         // +0x00  (8B) — pointer to domain_ops/data
+ *     u64   flags_or_count;      // +0x08  (8B) — e.g. 0x0E = PLL count?
+ *     void __iomem *fhctl_base;  // +0x10  (8B) — FHCTL register base (ioremapped)
+ *     void __iomem *pll_base;    // +0x18  (8B) — PLL register base (ioremapped)
+ *     void *hopping_fn;          // +0x20  (8B) — hopping function pointer (internal)
+ *     u32   perms;               // +0x28  (4B) — permissions mask from DTS
+ *     u32   fh_id;               // +0x2C  (4B) — fh-id from DTS
+ *     ... more fields
+ *   };
+ * Size per entry ≈ 0x90 bytes (confirmed from umaddl x14, w24, 0x90 in hopping code).
+ *
+ * _array is a flat array of pointers: _array[domain_idx] → array of per-PLL structs
+ * For MCU domains, each domain has exactly 1 PLL, so _array[mcu_domain_idx] → pll_data.
+ *
+ * Domain assignment in fhctl_probe -> fhctl_init:
+ *   map0 "top"  → ap      PLLs (mpll=fh2, mmpll=fh3, mainpll=fh4, etc)
+ *   map5 "gpu0" → gpueb   PLLs
+ *   map8 "gpu3" → gpueb   PLLs
+ *   map9 "mcu0" → mcupm   buspll (ccipll)
+ *   map10 "mcu1" → mcupm  cpu0pll (armpll_ll, L cluster)
+ *   map11 "mcu2" → mcupm  cpu1pll (armpll_bl, B cluster)
+ *   map12 "mcu3" → mcupm  cpu2pll (armpll_b,  P cluster)
+ *   map13 "mcu4" → mcupm  ptppll
+ *
+ * _array indices correspond to the DTS map order. Within each domain,
+ * PLLs are stored at _array[domain_start + fh_id]. For MCU single-PLL
+ * domains, _array[domain_idx] = pll_data for that single PLL.
+ *
+ * From previous dump: _array[0] = ap domain first PLL (mpll, fh2 at ptr[0])
+ * MCU PLLs should be at higher indices.
+ */
+static int set_fhctl_diag(const char *val, const struct kernel_param *kp)
+{
+	int pos = 0;
+	int i;
+
+	memset(fhctl_diag_buf, 0, sizeof(fhctl_diag_buf));
+
+	if (resolve_kallsyms()) {
+		snprintf(fhctl_diag_buf, FHCTL_DIAG_BUF_SIZE, "kallsyms_fail");
+		return 0;
+	}
+
+	resolve_fhctl_symbols();
+
+	pos += snprintf(fhctl_diag_buf + pos, FHCTL_DIAG_BUF_SIZE - pos,
+			"mcupm_hop=%px ap_hop=%px _array=%px | ",
+			fn_mcupm_hopping, fn_ap_hopping, (void *)fhctl_array_sym);
+
+	/* Scan _array as 64-bit pointer array (up to 64 entries) and
+	 * dump non-NULL entries with their per-PLL data fields.
+	 */
+	if (fhctl_array_sym) {
+		u64 *arr64 = (u64 *)fhctl_array_sym;
+
+		for (i = 0; i < 64 && pos < FHCTL_DIAG_BUF_SIZE - 200; i++) {
+			u64 *pd;
+			u64 hop_fn;
+			u32 perms, fh_id_val;
+			void __iomem *fhctl_base, *pll_reg_base;
+
+			if (arr64[i] == 0)
+				continue;
+
+			pd = (u64 *)arr64[i];
+
+			/* Read key fields from per-PLL data structure */
+			fhctl_base = (void __iomem *)pd[2]; /* +0x10 */
+			pll_reg_base = (void __iomem *)pd[3]; /* +0x18 */
+			hop_fn = pd[4]; /* +0x20 hopping function ptr (or internal ops) */
+			perms = (u32)(pd[5] >> 32); /* +0x2C (high 32 of qword at +0x28) */
+			fh_id_val = (u32)pd[5];     /* +0x28 (low 32) */
+
+			pos += snprintf(fhctl_diag_buf + pos,
+				FHCTL_DIAG_BUF_SIZE - pos,
+				"[%d] @%px fh=%px pll=%px hop=%px p=%x id=%u | ",
+				i, (void *)arr64[i], fhctl_base,
+				pll_reg_base, (void *)hop_fn, perms, fh_id_val);
+
+			/* Verbose: dump first 12 qwords of this entry */
+			if (pos < FHCTL_DIAG_BUF_SIZE - 250) {
+				int j;
+				pos += snprintf(fhctl_diag_buf + pos,
+					FHCTL_DIAG_BUF_SIZE - pos, "raw: ");
+				for (j = 0; j < 12 && pos < FHCTL_DIAG_BUF_SIZE - 24; j++)
+					pos += snprintf(fhctl_diag_buf + pos,
+						FHCTL_DIAG_BUF_SIZE - pos,
+						"%016llx ", pd[j]);
+				pos += snprintf(fhctl_diag_buf + pos,
+					FHCTL_DIAG_BUF_SIZE - pos, "|| ");
+			}
+		}
+
+		if (pos < FHCTL_DIAG_BUF_SIZE - 40)
+			pos += snprintf(fhctl_diag_buf + pos,
+				FHCTL_DIAG_BUF_SIZE - pos, "END");
+	}
+
+	pr_info("KPM_OC: fhctl diag: %s\n", fhctl_diag_buf);
+	return 0;
+}
+
+static const struct kernel_param_ops fhctl_diag_ops = { .set = set_fhctl_diag };
+static int fhctl_diag_dummy;
+module_param_cb(fhctl_scan, &fhctl_diag_ops, &fhctl_diag_dummy, 0220);
+MODULE_PARM_DESC(fhctl_scan, "Write 1 to dump fhctl internal state");
+
+/* ─── mcupm_hopping_v1 direct caller ─────────────────────────────────────
+ *
+ * Call mcupm_hopping_v1 directly with resolved pll_data from _array.
+ * Format: "array_idx,fh_id,dds_hex[,postdiv]"
+ * Example: "10,0,0x21a762,-1"  → _array[10], fh_id=0, dds=0x21a762, pdiv=-1
+ *
+ * Also supports "scan" to try calling with stock DDS on each non-NULL entry.
+ */
+#define MCUPM_HOP_BUF_SIZE 1024
+static char mcupm_hop_buf[MCUPM_HOP_BUF_SIZE];
+module_param_string(mcupm_hop_result, mcupm_hop_buf, sizeof(mcupm_hop_buf), 0444);
+MODULE_PARM_DESC(mcupm_hop_result, "Result of mcupm_hopping_v1 call (read-only)");
+
+static int __nocfi set_mcupm_hop(const char *val, const struct kernel_param *kp)
+{
+	char tmp[64], *p1, *p2, *p3;
+	unsigned long arr_idx = 0, fh_id_l = 0, dds_l = 0;
+	long postdiv_l = -1;
+	u64 *arr64;
+	void *pll_data;
+	int ret;
+
+	memset(mcupm_hop_buf, 0, sizeof(mcupm_hop_buf));
+
+	if (!fn_mcupm_hopping || !fhctl_array_sym) {
+		if (resolve_kallsyms())
+			return -ENOENT;
+		resolve_fhctl_symbols();
+	}
+
+	if (!fn_mcupm_hopping) {
+		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+			 "ERR: mcupm_hopping_v1 not found");
+		return -ENOENT;
+	}
+	if (!fhctl_array_sym) {
+		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+			 "ERR: _array not found");
+		return -ENOENT;
+	}
+
+	strscpy(tmp, val, sizeof(tmp));
+
+	/* Parse "array_idx,fh_id,dds_hex[,postdiv]" */
+	p1 = strchr(tmp, ',');
+	if (!p1) {
+		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+			 "ERR: format: array_idx,fh_id,dds_hex[,postdiv]");
+		return -EINVAL;
+	}
+	*p1++ = '\0';
+	p2 = strchr(p1, ',');
+	if (!p2) {
+		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+			 "ERR: format: array_idx,fh_id,dds_hex[,postdiv]");
+		return -EINVAL;
+	}
+	*p2++ = '\0';
+	p3 = strchr(p2, ',');
+	if (p3) {
+		*p3++ = '\0';
+		if (kstrtol(p3, 0, &postdiv_l))
+			return -EINVAL;
+	}
+
+	if (kstrtoul(tmp, 0, &arr_idx) || kstrtoul(p1, 0, &fh_id_l) ||
+	    kstrtoul(p2, 0, &dds_l))
+		return -EINVAL;
+
+	if (arr_idx > 63 || dds_l > 0x3FFFFF) {
+		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+			 "ERR: arr_idx=%lu (max 63) dds=0x%lx (max 0x3FFFFF)",
+			 arr_idx, dds_l);
+		return -EINVAL;
+	}
+
+	arr64 = (u64 *)fhctl_array_sym;
+	pll_data = (void *)arr64[arr_idx];
+	if (!pll_data) {
+		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+			 "ERR: _array[%lu] is NULL", arr_idx);
+		return -ENOENT;
+	}
+
+	pr_info("KPM_OC: mcupm_hop: arr[%lu]=%px fh_id=%lu dds=0x%06lx pdiv=%ld\n",
+		arr_idx, pll_data, fh_id_l, dds_l, postdiv_l);
+
+	ret = fn_mcupm_hopping(pll_data, NULL, (int)fh_id_l,
+			       (unsigned int)dds_l, (int)postdiv_l);
+
+	snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+		 "arr[%lu]=%px fh=%lu dds=0x%06lx pdiv=%ld → ret=%d",
+		 arr_idx, pll_data, fh_id_l, dds_l, postdiv_l, ret);
+
+	pr_info("KPM_OC: mcupm_hop result: %s\n", mcupm_hop_buf);
+	return 0;
+}
+
+static const struct kernel_param_ops mcupm_hop_ops = { .set = set_mcupm_hop };
+static int mcupm_hop_dummy;
+module_param_cb(mcupm_hop, &mcupm_hop_ops, &mcupm_hop_dummy, 0220);
+MODULE_PARM_DESC(mcupm_hop, "Call mcupm_hopping_v1: array_idx,fh_id,dds[,postdiv]");
+
+/* ─── CPU OC via CSRAM LUT[0] patch + cpufreq policy update ─────────────── */
+
 static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 {
 	/* Indexed by cluster order: L=0, B=1, P=2 (matches cluster_policies[]) */
@@ -375,16 +1128,12 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 		orig_freq_mhz = orig_lut & LUT_FREQ_MASK;
 		orig_volt_uv  = LUT_VOLT_DECODE(orig_lut);
 
-		if (orig_freq_mhz < 100 || orig_freq_mhz > 5000) {
-			pr_warn("KPM_OC: CPU %s LUT[0] unexpected freq=%u MHz\n",
+		if (orig_freq_mhz < 100 || orig_freq_mhz > 5000)
+			pr_warn("KPM_OC: CPU %s LUT[0] unexpected freq=%u MHz (repairing)\n",
 				cluster_names[c], orig_freq_mhz);
-			pos += snprintf(cpu_oc_result + pos, CPU_RESULT_BUF_SIZE - pos,
-					"%s=BAD_ORIG,", cluster_names[c]);
-			continue;
-		}
 
 		new_freq_mhz = target_khz / 1000;
-		if (new_freq_mhz > 5000) {
+		if (new_freq_mhz < 100 || new_freq_mhz > 5000) {
 			pr_warn("KPM_OC: CPU %s target %u MHz out of range\n",
 				cluster_names[c], new_freq_mhz);
 			pos += snprintf(cpu_oc_result + pos, CPU_RESULT_BUF_SIZE - pos,
@@ -643,19 +1392,10 @@ static struct kprobe userlimit_kp = {
  * Root cause: MCUPM firmware runs on a dedicated MCU and has direct access
  * to CSRAM.  It continuously recalculates and overwrites LUT voltage fields
  * (freq bits[11:0] are preserved, but bits[28:12] = voltage are replaced).
- * The periodic 500ms relift cannot keep up — there is always a window where
- * CSRAM holds an incorrect (MCUPM-computed) voltage for the OC'd frequency.
  *
- * Fix: Kprobe on mtk_cpufreq_hw_fast_switch / mtk_cpufreq_hw_target_index.
- * These are called on every CPU DVFS transition, right before the driver
- * writes REG_FREQ_PERF_STATE (offset 0x88).  In the pre-handler we re-write
- * CSRAM LUT voltages for entries that have active overrides OR are LUT[0]
- * with an OC freq target.  The HW perf-controller then reads our voltage
- * within nanoseconds, far too fast for MCUPM to overwrite again.
- *
- * Also patches LUT[0] voltage from cpu_oc_*_volt (the OC top-OPP voltage)
- * so that even without per-LUT cpu_volt_override, the OC'd top-OPP gets the
- * correct voltage on every transition.
+ * Fix: Kprobe on scmi_cpufreq_fast_switch (the actual DVFS path on this SoC,
+ * since it uses scmi_cpufreq driver — not mtk-cpufreq-hw).  In the
+ * pre-handler we re-write CSRAM LUT voltages and trigger PLL re-enforcement.
  */
 static void __nocfi cpu_csram_resync_fast(void)
 {
@@ -713,38 +1453,309 @@ static void __nocfi cpu_csram_resync_fast(void)
 	 */
 }
 
-/*
- * Kprobe pre-handler: fires immediately before mtk_cpufreq_hw writes
- * REG_FREQ_PERF_STATE to trigger a DVFS transition.
- * AArch64: x0 = struct cpufreq_policy *, x1 = target_freq (unsigned int)
- */
-static int __nocfi cpufreq_hw_fast_switch_kp_pre(struct kprobe *p,
-						 struct pt_regs *regs)
+/* ─── SCMI capture buffer (shared by perf_level and dvfs_freq kprobes) ─ */
+#define SCMI_CAP_BUF_SIZE 2048
+static char scmi_cap_buf[SCMI_CAP_BUF_SIZE];
+static int scmi_cap_pos;
+
+/* Forward declarations for cpufreq kprobe counters */
+static atomic_t scmi_cpufreq_hit_count = ATOMIC_INIT(0);
+static u32 scmi_last_target_freq;
+
+static int get_scmi_capture(char *buf, const struct kernel_param *kp)
 {
+	int len = 0;
+
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "cpufreq_hits=%d last_target=%u\n",
+			 atomic_read(&scmi_cpufreq_hit_count),
+			 READ_ONCE(scmi_last_target_freq));
+	if (scmi_cap_pos > 0)
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "perf: %s\n", scmi_cap_buf);
+	else
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "perf: (no calls)\n");
+	return len;
+}
+
+static const struct kernel_param_ops scmi_cap_ops = { .get = get_scmi_capture };
+static int scmi_cap_dummy;
+module_param_cb(scmi_capture, &scmi_cap_ops, &scmi_cap_dummy, 0444);
+MODULE_PARM_DESC(scmi_capture, "Captured SCMI DVFS calls (read-only)");
+
+/*
+ * Kprobe pre-handler: fires on SCMI cpufreq DVFS transitions.
+ * Resyncs CSRAM voltages and triggers PLL re-enforcement.
+ * scmi_cpufreq_fast_switch: x0 = policy *, x1 = target_freq (unsigned int)
+ * scmi_cpufreq_set_target:  x0 = policy *, x1 = target_freq (unsigned int)
+ *
+ * Uses only lock-free, IRQ-safe primitives.
+ */
+static int __nocfi scmi_cpufreq_kp_pre(struct kprobe *p,
+					struct pt_regs *regs)
+{
+	unsigned int target_freq = (unsigned int)regs->regs[1];
+
+	WRITE_ONCE(scmi_last_target_freq, target_freq);
+	atomic_inc(&scmi_cpufreq_hit_count);
+
 	cpu_csram_resync_fast();
 	return 0;
 }
 
-static struct kprobe cpufreq_hw_fast_switch_kp = {
-	.symbol_name = "mtk_cpufreq_hw_fast_switch",
-	.pre_handler = cpufreq_hw_fast_switch_kp_pre,
+static struct kprobe scmi_fast_switch_kp = {
+	.symbol_name = "scmi_cpufreq_fast_switch",
+	.pre_handler = scmi_cpufreq_kp_pre,
 };
 
+static struct kprobe scmi_set_target_kp = {
+	.symbol_name = "scmi_cpufreq_set_target",
+	.pre_handler = scmi_cpufreq_kp_pre,
+};
+
+/* ─── SCMI perf_level_set capture & override ────────────────────────────── */
 /*
- * Same for the non-fast-switch path (target_index).
- * AArch64: x0 = struct cpufreq_policy *, x1 = index (unsigned int)
+ * scmi_perf_level_set(handle, domain, level, poll)
+ * AArch64: x0=handle, w1=domain, w2=level, w3=poll
+ *
+ * Captures perf_level values sent by the cpufreq driver to MCUPM.
+ * If scmi_level_override is set for a domain, replaces the level.
  */
-static int __nocfi cpufreq_hw_target_index_kp_pre(struct kprobe *p,
-						  struct pt_regs *regs)
+
+/* Per-domain level override: 0 = no override */
+static u32 scmi_level_override[8]; /* max 8 domains */
+
+static int __nocfi scmi_perf_kp_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	cpu_csram_resync_fast();
+	unsigned int domain = (unsigned int)regs->regs[1];
+	unsigned int level = (unsigned int)regs->regs[2];
+
+	/* Capture */
+	if (scmi_cap_pos > SCMI_CAP_BUF_SIZE - 60)
+		scmi_cap_pos = 0;
+	scmi_cap_pos += snprintf(scmi_cap_buf + scmi_cap_pos,
+				 SCMI_CAP_BUF_SIZE - scmi_cap_pos,
+				 "d%u:L%u ", domain, level);
+
+	/* Override if set */
+	if (domain < 8 && scmi_level_override[domain] != 0 &&
+	    level == scmi_level_override[domain] - 1) {
+		/* Override: when kernel sends the stock max level (target-1),
+		 * replace with the OC level (target).  The -1/+0 encoding
+		 * prevents infinite self-overrides. */
+	}
+
+	/* Direct override: replace level for domain if override > 0 */
+	if (domain < 8 && scmi_level_override[domain] > 0) {
+		regs->regs[2] = scmi_level_override[domain];
+		pr_info_ratelimited("KPM_OC: SCMI override: d%u level %u→%u\n",
+				    domain, level, scmi_level_override[domain]);
+	}
+
 	return 0;
 }
 
-static struct kprobe cpufreq_hw_target_index_kp = {
-	.symbol_name = "mtk_cpufreq_hw_target_index",
-	.pre_handler = cpufreq_hw_target_index_kp_pre,
+static struct kprobe scmi_perf_level_kp = {
+	.symbol_name = "scmi_perf_level_set",
+	.pre_handler = scmi_perf_kp_pre,
 };
+
+/*
+ * scmi_dvfs_freq_set(handle, domain, freq_hz, poll)
+ * AArch64: x0=handle, w1=domain, x2=freq_hz (unsigned long), w3=poll
+ * This is the function pointer target for perf_ops->freq_set.
+ */
+static int __nocfi scmi_dvfs_freq_kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	unsigned int domain = (unsigned int)regs->regs[1];
+	unsigned long freq_hz = (unsigned long)regs->regs[2];
+
+	if (scmi_cap_pos > SCMI_CAP_BUF_SIZE - 60)
+		scmi_cap_pos = 0;
+	scmi_cap_pos += snprintf(scmi_cap_buf + scmi_cap_pos,
+				 SCMI_CAP_BUF_SIZE - scmi_cap_pos,
+				 "D%u:%luHz ", domain, freq_hz);
+	return 0;
+}
+
+static struct kprobe scmi_dvfs_freq_kp = {
+	.symbol_name = "scmi_dvfs_freq_set",
+	.pre_handler = scmi_dvfs_freq_kp_pre,
+};
+
+/* Set SCMI level override: "domain,level"  (0 to clear) */
+static int set_scmi_override(const char *val, const struct kernel_param *kp)
+{
+	unsigned long domain = 0, level = 0;
+	char tmp[32], *comma;
+
+	strscpy(tmp, val, sizeof(tmp));
+	comma = strchr(tmp, ',');
+	if (!comma)
+		return -EINVAL;
+	*comma = '\0';
+	if (kstrtoul(tmp, 0, &domain) || kstrtoul(comma + 1, 0, &level))
+		return -EINVAL;
+	if (domain >= 8)
+		return -EINVAL;
+
+	scmi_level_override[domain] = (u32)level;
+	pr_info("KPM_OC: SCMI level override: domain %lu → %lu\n", domain, level);
+	return 0;
+}
+
+static const struct kernel_param_ops scmi_ov_ops = { .set = set_scmi_override };
+static int scmi_ov_dummy;
+module_param_cb(scmi_override, &scmi_ov_ops, &scmi_ov_dummy, 0220);
+MODULE_PARM_DESC(scmi_override, "Override SCMI perf level: domain,level (0=clear)");
+
+/* ─── mcupm_hopping_v1 argument capture ─────────────────────────────────── */
+/*
+ * Kprobe on mcupm_hopping_v1 in fhctl module:
+ *   int mcupm_hopping_v1(void *priv_data, const char *domain,
+ *                        int fh_id, unsigned int new_dds, int postdiv)
+ * AArch64: x0=priv_data, x1=domain, w2=fh_id, w3=new_dds, w4=postdiv
+ */
+#define FHCTL_CAP_BUF_SIZE 2048
+static char fhctl_cap_buf[FHCTL_CAP_BUF_SIZE];
+module_param_string(fhctl_capture, fhctl_cap_buf, sizeof(fhctl_cap_buf), 0444);
+MODULE_PARM_DESC(fhctl_capture, "Last captured mcupm_hopping_v1 calls (read-only)");
+static int fhctl_cap_pos;
+
+static int __nocfi fhctl_hop_kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	unsigned int fh_id = (unsigned int)regs->regs[2];
+	unsigned int new_dds = (unsigned int)regs->regs[3];
+	unsigned int postdiv = (unsigned int)regs->regs[4];
+
+	/* Ring buffer: newest entries overwrite oldest */
+	if (fhctl_cap_pos > FHCTL_CAP_BUF_SIZE - 80)
+		fhctl_cap_pos = 0;
+
+	fhctl_cap_pos += snprintf(fhctl_cap_buf + fhctl_cap_pos,
+				  FHCTL_CAP_BUF_SIZE - fhctl_cap_pos,
+				  "hop fh_id=%u dds=0x%08x pdiv=%u | ",
+				  fh_id, new_dds, postdiv);
+
+	pr_info_ratelimited("KPM_OC: FH hop fh_id=%u dds=0x%08x pdiv=%u\n",
+			    fh_id, new_dds, postdiv);
+	return 0;
+}
+
+static struct kprobe fhctl_hop_kp = {
+	.symbol_name = "mcupm_hopping_v1",
+	.pre_handler = fhctl_hop_kp_pre,
+};
+
+/* ─── IPI-based PLL overclock via MCUPM fhctl ──────────────────────────── */
+/*
+ * Construct and send an FHCTL IPI message to MCUPM to request a PLL
+ * frequency change.  Uses the same IPI mechanism as mcupm_hopping_v1.
+ *
+ * IPI message format (9 x u32):
+ *   [0] = cmd (0x1006 = FHCTL DVFS command)
+ *   [1] = fh_id (PLL hopping index)
+ *   [2] = new_dds (target DDS value)
+ *   [3] = postdiv (-1 = no postdiv change)
+ *   [4..8] = reserved/zero
+ *
+ * Write format: "fh_id,dds_hex[,postdiv]"
+ * Example:  "2,0x203627"      → fh_id=2, dds=0x203627, postdiv=-1
+ *           "3,0x248B06,0"    → fh_id=3, dds=0x248B06, postdiv=0
+ *
+ * NOTE: This is EXPERIMENTAL.  MCUPM may reject or ignore the DDS value.
+ */
+
+/* External MCUPM API (exported from mcupm.ko and mtk_tinysys_ipi.ko) */
+struct mtk_ipi_device;  /* forward decl */
+extern struct mtk_ipi_device *get_mcupm_ipidev(void);
+extern int mtk_ipi_send_compl(struct mtk_ipi_device *ipidev,
+			      int ipi_id, int opt,
+			      void *data, int len, unsigned long timeout);
+
+#define FHCTL_IPI_CMD        0x1006
+#define FHCTL_IPI_PIN        2      /* hardcoded in mcupm_hopping_v1 disasm (mov w1, #0x2) */
+#define FHCTL_IPI_MSG_LEN    9      /* 9 x u32 words */
+#define FHCTL_IPI_TIMEOUT    2000   /* ms */
+
+#define FHCTL_OC_BUF_SIZE   512
+static char fhctl_oc_buf[FHCTL_OC_BUF_SIZE];
+module_param_string(fhctl_oc_result, fhctl_oc_buf, sizeof(fhctl_oc_buf), 0444);
+MODULE_PARM_DESC(fhctl_oc_result, "Result of last fhctl IPI OC attempt (read-only)");
+
+static int set_fhctl_oc(const char *val, const struct kernel_param *kp)
+{
+	unsigned long fh_id_l = 0, dds_l = 0;
+	long postdiv_l = -1;  /* -1 = no postdiv change */
+	u32 ipi_msg[FHCTL_IPI_MSG_LEN];
+	struct mtk_ipi_device *ipidev;
+	int ret;
+	char tmp[64], *p1, *p2;
+
+	memset(fhctl_oc_buf, 0, sizeof(fhctl_oc_buf));
+
+	strscpy(tmp, val, sizeof(tmp));
+
+	/* Parse "fh_id,dds_hex[,postdiv]" */
+	p1 = strchr(tmp, ',');
+	if (!p1) {
+		snprintf(fhctl_oc_buf, FHCTL_OC_BUF_SIZE,
+			 "ERR: format: fh_id,dds_hex[,postdiv]");
+		return -EINVAL;
+	}
+	*p1++ = '\0';
+	p2 = strchr(p1, ',');
+	if (p2) {
+		*p2++ = '\0';
+		if (kstrtol(p2, 0, &postdiv_l))
+			return -EINVAL;
+	}
+
+	if (kstrtoul(tmp, 0, &fh_id_l) || kstrtoul(p1, 0, &dds_l))
+		return -EINVAL;
+
+	if (fh_id_l > 15 || dds_l > 0x3FFFFF) {
+		snprintf(fhctl_oc_buf, FHCTL_OC_BUF_SIZE,
+			 "ERR: fh_id=%lu (max 15), dds=0x%lx (max 0x3FFFFF)",
+			 fh_id_l, dds_l);
+		return -EINVAL;
+	}
+
+	/* Get MCUPM IPI device */
+	ipidev = get_mcupm_ipidev();
+	if (!ipidev) {
+		snprintf(fhctl_oc_buf, FHCTL_OC_BUF_SIZE,
+			 "ERR: get_mcupm_ipidev() returned NULL");
+		return -ENODEV;
+	}
+
+	/* Construct IPI message */
+	memset(ipi_msg, 0, sizeof(ipi_msg));
+	ipi_msg[0] = FHCTL_IPI_CMD;         /* 0x1006 */
+	ipi_msg[1] = (u32)fh_id_l;
+	ipi_msg[2] = (u32)dds_l;
+	ipi_msg[3] = (u32)(int)postdiv_l;   /* -1 or specific value */
+
+	pr_info("KPM_OC: FHCTL IPI OC: fh_id=%lu dds=0x%06lx pdiv=%ld\n",
+		fh_id_l, dds_l, postdiv_l);
+
+	ret = mtk_ipi_send_compl(ipidev, FHCTL_IPI_PIN, 1,
+				 ipi_msg, FHCTL_IPI_MSG_LEN,
+				 FHCTL_IPI_TIMEOUT);
+
+	snprintf(fhctl_oc_buf, FHCTL_OC_BUF_SIZE,
+		 "fh_id=%lu dds=0x%06lx pdiv=%ld → IPI ret=%d",
+		 fh_id_l, dds_l, postdiv_l, ret);
+
+	pr_info("KPM_OC: FHCTL IPI result: %s\n", fhctl_oc_buf);
+	return 0;
+}
+
+static const struct kernel_param_ops fhctl_oc_ops = { .set = set_fhctl_oc };
+static int fhctl_oc_dummy;
+module_param_cb(fhctl_oc, &fhctl_oc_ops, &fhctl_oc_dummy, 0220);
+MODULE_PARM_DESC(fhctl_oc, "FHCTL IPI OC: write fh_id,dds_hex[,postdiv]");
 
 static void cpu_reapply_volt_overrides_locked(void)
 {
@@ -1205,13 +2216,17 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 	if (tgt_freq == 0)
 		return 0;
 
-	/* Re-patch default_opp_table[0] */
+	/* Unconditionally re-patch default_opp_table[0].
+	 * GPUEB firmware continuously overwrites freq+volt+vsram in shared
+	 * memory, so we must force ALL three fields every commit — not just
+	 * volt/vsram.  The old "if (tbl[0] == tgt_freq)" guard caused the
+	 * kprobe to skip the patch entirely once GPUEB reverted freq.
+	 */
 	if (opp_table_anchor) {
 		tbl = (u32 *)opp_table_anchor;
-		if (tbl[0] == tgt_freq) {
-			tbl[1] = tgt_volt;
-			tbl[2] = tgt_vsram;
-		}
+		WRITE_ONCE(tbl[0], tgt_freq);
+		WRITE_ONCE(tbl[1], tgt_volt);
+		WRITE_ONCE(tbl[2], tgt_vsram);
 		/* Per-OPP voltage overrides */
 		if (gpu_volt_ov_count > 0) {
 			for (i = 0; i < GPU_MAX_OPPS; i++) {
@@ -1221,22 +2236,25 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 				if (!ov && !vs)
 					continue;
 				e = tbl + i * (GPU_OPP_STRIDE / 4);
-				if (ov) e[1] = ov;
-				if (vs) e[2] = vs;
+				if (ov) WRITE_ONCE(e[1], ov);
+				if (vs) WRITE_ONCE(e[2], vs);
 			}
 		}
 	}
 
-	/* Re-patch working_table[0] (shared memory — GPUEB will overwrite,
-	 * but commit reads it before GPUEB can react) */
+	/* Unconditionally re-patch working_table[0] (shared memory).
+	 * Must write freq+volt+vsram right before commit reads them to
+	 * minimise the GPUEB overwrite race window.
+	 */
 	tbl = NULL;
 	if (fn_get_working_table_gpu)
 		tbl = fn_get_working_table_gpu();
 	if (!tbl && fn_get_working_table_wrap)
 		tbl = fn_get_working_table_wrap(0);
-	if (tbl && tbl[0] == tgt_freq) {
-		tbl[1] = tgt_volt;
-		tbl[2] = tgt_vsram;
+	if (tbl) {
+		WRITE_ONCE(tbl[0], tgt_freq);
+		WRITE_ONCE(tbl[1], tgt_volt);
+		WRITE_ONCE(tbl[2], tgt_vsram);
 		/* Per-OPP overrides on working table */
 		if (gpu_volt_ov_count > 0) {
 			for (i = 0; i < GPU_MAX_OPPS; i++) {
@@ -1246,8 +2264,8 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 				if (!ov && !vs)
 					continue;
 				e = tbl + i * (GPU_OPP_STRIDE / 4);
-				if (ov) e[1] = ov;
-				if (vs) e[2] = vs;
+				if (ov) WRITE_ONCE(e[1], ov);
+				if (vs) WRITE_ONCE(e[2], vs);
 			}
 		}
 	}
@@ -1284,14 +2302,17 @@ static int gpu_oc_kthread_fn(void *data)
 
 		mutex_lock(&lock);
 		gpu_oc_patched |= gpu_oc_patch_wk_ss();
-		now = gpu_oc_patched & 6;
+		/* Check working_table bit only; signed_table may be NULL on
+		 * this SoC and that is expected — not a miss condition.
+		 */
+		now = gpu_oc_patched & 2;
 		mutex_unlock(&lock);
 
-		if (now == 6 && last_state != 6)
-			pr_info("KPM_OC: GPU relift: working+signed patched (patched=%d)\n",
+		if (now == 2 && last_state != 2)
+			pr_info("KPM_OC: GPU relift: working patched (patched=%d)\n",
 				gpu_oc_patched);
 
-		if (now != 6) {
+		if (now != 2) {
 			miss_cnt++;
 			if (miss_cnt >= 600) {
 				mutex_lock(&lock);
@@ -1749,9 +2770,38 @@ static int __init kpm_oc_init(void)
 		return -ENOMEM;
 	}
 
+	/* ioremap MCU PLL subsystem for direct ARMPLL access */
+	mcu_pll_base = ioremap(MCU_PLL_PHYS_BASE, MCU_PLL_PHYS_SIZE);
+	if (!mcu_pll_base)
+		pr_warn("KPM_OC: Failed to ioremap MCU PLL at 0x%lx (PLL bypass disabled)\n",
+			MCU_PLL_PHYS_BASE);
+	else
+		pr_info("KPM_OC: MCU PLL region mapped at %px (phys 0x%lx, %lu bytes)\n",
+			mcu_pll_base, MCU_PLL_PHYS_BASE, MCU_PLL_PHYS_SIZE);
+
+	/* ioremap MCUPM SRAM for frequency table scanning */
+	mcupm_sram_base = ioremap(MCUPM_SRAM_PHYS_BASE, MCUPM_SRAM_PHYS_SIZE);
+	if (!mcupm_sram_base)
+		pr_warn("KPM_OC: Failed to ioremap MCUPM SRAM at 0x%lx\n",
+			MCUPM_SRAM_PHYS_BASE);
+	else
+		pr_info("KPM_OC: MCUPM SRAM mapped at %px (phys 0x%lx, %lu bytes)\n",
+			mcupm_sram_base, MCUPM_SRAM_PHYS_BASE,
+			MCUPM_SRAM_PHYS_SIZE);
+
+	/* ioremap MCUPM reserved DRAM for frequency table scanning */
+	mcupm_dram_base = ioremap(MCUPM_DRAM_PHYS_BASE, MCUPM_DRAM_PHYS_SIZE);
+	if (!mcupm_dram_base)
+		pr_warn("KPM_OC: Failed to ioremap MCUPM DRAM at 0x%lx\n",
+			MCUPM_DRAM_PHYS_BASE);
+	else
+		pr_info("KPM_OC: MCUPM DRAM mapped at %px (phys 0x%lx, %lu bytes)\n",
+			mcupm_dram_base, MCUPM_DRAM_PHYS_BASE,
+			MCUPM_DRAM_PHYS_SIZE);
+
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
 	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v7.2 (base=0x%lx)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v8.1 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Register kprobes for freq_qos and userlimit interception */
@@ -1775,27 +2825,28 @@ static int __init kpm_oc_init(void)
 			pr_info("KPM_OC: update_userlimit_cpufreq_max kprobe registered\n");
 	}
 
-	/* MCUPM CSRAM countermeasure: kprobe on cpufreq-hw DVFS transitions
-	 * to re-patch LUT voltages immediately before HW reads them.
+	/* SCMI cpufreq DVFS kprobes: intercept frequency transitions for
+	 * CSRAM voltage resync and PLL re-enforcement triggering.
+	 * On MT6897 this SoC uses scmi_cpufreq (not mtk-cpufreq-hw).
 	 */
 	{
-		int kret3 = register_kprobe(&cpufreq_hw_fast_switch_kp);
+		int kret3 = register_kprobe(&scmi_fast_switch_kp);
 
 		if (kret3 < 0)
-			pr_warn("KPM_OC: cpufreq_hw fast_switch kprobe failed (%d)\n",
+			pr_warn("KPM_OC: scmi_cpufreq_fast_switch kprobe failed (%d)\n",
 				kret3);
 		else
-			pr_info("KPM_OC: mtk_cpufreq_hw_fast_switch kprobe registered (MCUPM countermeasure)\n");
+			pr_info("KPM_OC: scmi_cpufreq_fast_switch kprobe registered\n");
 	}
 
 	{
-		int kret4 = register_kprobe(&cpufreq_hw_target_index_kp);
+		int kret4 = register_kprobe(&scmi_set_target_kp);
 
 		if (kret4 < 0)
-			pr_warn("KPM_OC: cpufreq_hw target_index kprobe failed (%d)\n",
+			pr_warn("KPM_OC: scmi_cpufreq_set_target kprobe failed (%d)\n",
 				kret4);
 		else
-			pr_info("KPM_OC: mtk_cpufreq_hw_target_index kprobe registered (MCUPM countermeasure)\n");
+			pr_info("KPM_OC: scmi_cpufreq_set_target kprobe registered\n");
 	}
 
 	/* GPUEB countermeasure: kprobe on GPU DVFS commit to re-patch OPP
@@ -1809,6 +2860,39 @@ static int __init kpm_oc_init(void)
 				kret5);
 		else
 			pr_info("KPM_OC: __gpufreq_generic_commit_gpu kprobe registered (GPUEB countermeasure)\n");
+	}
+
+	/* FHCTL mcupm_hopping_v1 argument capture kprobe */
+	{
+		int kret6 = register_kprobe(&fhctl_hop_kp);
+
+		if (kret6 < 0)
+			pr_warn("KPM_OC: mcupm_hopping_v1 kprobe failed (%d)\n",
+				kret6);
+		else
+			pr_info("KPM_OC: mcupm_hopping_v1 kprobe registered (DDS capture)\n");
+	}
+
+	/* SCMI perf_level_set kprobe for capturing/overriding performance levels */
+	{
+		int kret7 = register_kprobe(&scmi_perf_level_kp);
+
+		if (kret7 < 0)
+			pr_warn("KPM_OC: scmi_perf_level_set kprobe failed (%d)\n",
+				kret7);
+		else
+			pr_info("KPM_OC: scmi_perf_level_set kprobe registered (level capture+override)\n");
+	}
+
+	/* SCMI dvfs_freq_set kprobe */
+	{
+		int kret8 = register_kprobe(&scmi_dvfs_freq_kp);
+
+		if (kret8 < 0)
+			pr_warn("KPM_OC: scmi_dvfs_freq_set kprobe failed (%d)\n",
+				kret8);
+		else
+			pr_info("KPM_OC: scmi_dvfs_freq_set kprobe registered\n");
 	}
 
 	/* Auto-scan CPU OPP on load */
@@ -1844,9 +2928,12 @@ static void __exit kpm_oc_exit(void)
 {
 	unregister_kprobe(&freq_qos_kp);
 	unregister_kprobe(&userlimit_kp);
-	unregister_kprobe(&cpufreq_hw_fast_switch_kp);
-	unregister_kprobe(&cpufreq_hw_target_index_kp);
+	unregister_kprobe(&scmi_fast_switch_kp);
+	unregister_kprobe(&scmi_set_target_kp);
 	unregister_kprobe(&gpu_commit_kp);
+	unregister_kprobe(&fhctl_hop_kp);
+	unregister_kprobe(&scmi_perf_level_kp);
+	unregister_kprobe(&scmi_dvfs_freq_kp);
 	cpu_oc_relift_active = false;
 	cancel_delayed_work_sync(&cpu_oc_relift_dwork);
 	if (gpu_oc_task) {
@@ -1855,6 +2942,12 @@ static void __exit kpm_oc_exit(void)
 	}
 	if (csram_base)
 		iounmap(csram_base);
+	if (mcu_pll_base)
+		iounmap(mcu_pll_base);
+	if (mcupm_sram_base)
+		iounmap(mcupm_sram_base);
+	if (mcupm_dram_base)
+		iounmap(mcupm_dram_base);
 	pr_info("KPM_OC: Unloaded.\n");
 }
 
@@ -1862,4 +2955,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher v7.2");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass v8.0");
