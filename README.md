@@ -10,6 +10,8 @@ Kernel module (v7.6) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 - **GPU per-OPP voltage override** — direct memory write for any OPP entry, bypassing vendor `fix_custom_freq_volt` validation
 - **GPUEB OPP countermeasure** *(v7.2)* — kprobe on the GPU DVFS commit function re-patches OPP voltages immediately before the commit reads them, preventing GPUEB firmware from reverting OC voltage
 
+Used by the [APatch module (v8.0)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, persistent configuration, and a boot-time service with gaming monitor daemon.
+
 ## Hardware Details
 
 | Item | Value |
