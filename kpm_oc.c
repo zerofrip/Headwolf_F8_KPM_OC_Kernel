@@ -557,6 +557,67 @@ static int pll_dump_dummy;
 module_param_cb(pll_scan, &pll_dump_ops, &pll_dump_dummy, 0220);
 MODULE_PARM_DESC(pll_scan, "Write 1 to dump PLL registers");
 
+/* ─── CSRAM perf_state diagnostic ───────────────────────────────────────── */
+/*
+ * Read REG_FREQ_PERF_STATE (offset 0x88) from each CSRAM domain, and also
+ * read back LUT[0] freq bits, to diagnose whether the governor-selected
+ * index matches what HW reports and whether LUT patching is effective.
+ *
+ * Also reads the "csram_sys" region (offset 0x8C = REG_FREQ_HW_STATE) which
+ * vendor mtk_cpufreq_hw may use for actual freq readback.
+ */
+#define REG_PERF_STATE_OFF  0x88
+#define REG_HW_STATE_OFF    0x8C
+#define PERF_DIAG_BUF_SIZE  2048
+static char perf_diag_buf[PERF_DIAG_BUF_SIZE];
+module_param_string(perf_diag, perf_diag_buf, sizeof(perf_diag_buf), 0444);
+MODULE_PARM_DESC(perf_diag, "CSRAM perf_state diagnostic (read-only)");
+
+static int set_perf_diag(const char *val, const struct kernel_param *kp)
+{
+	int c, pos = 0;
+
+	memset(perf_diag_buf, 0, sizeof(perf_diag_buf));
+
+	if (!csram_base) {
+		snprintf(perf_diag_buf, PERF_DIAG_BUF_SIZE, "NOT_MAPPED");
+		return 0;
+	}
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		void __iomem *dom = csram_base + domain_offsets[c];
+		u32 perf_state = readl(dom + REG_PERF_STATE_OFF);
+		u32 hw_state   = readl(dom + REG_HW_STATE_OFF);
+		u32 lut0_raw   = readl(dom + REG_FREQ_LUT);
+		u32 lut0_freq  = lut0_raw & LUT_FREQ_MASK;
+		int i;
+
+		pos += snprintf(perf_diag_buf + pos, PERF_DIAG_BUF_SIZE - pos,
+				"[%s] perf_idx=%u hw_state=0x%08x "
+				"lut0=0x%08x(%uMHz)",
+				cluster_names[c], perf_state, hw_state,
+				lut0_raw, lut0_freq);
+
+		/* Also read +0x90..+0xBF (32 bytes after hw_state) for vendor extras */
+		pos += snprintf(perf_diag_buf + pos, PERF_DIAG_BUF_SIZE - pos,
+				" extra[0x90-0xAC]=");
+		for (i = 0; i < 8 && pos < PERF_DIAG_BUF_SIZE - 12; i++)
+			pos += snprintf(perf_diag_buf + pos,
+					PERF_DIAG_BUF_SIZE - pos, "%08x ",
+					readl(dom + 0x90 + i * 4));
+
+		pos += snprintf(perf_diag_buf + pos, PERF_DIAG_BUF_SIZE - pos, "| ");
+	}
+
+	pr_info("KPM_OC: perf_diag: %s\n", perf_diag_buf);
+	return 0;
+}
+
+static const struct kernel_param_ops perf_diag_ops = { .set = set_perf_diag };
+static int perf_diag_dummy;
+module_param_cb(perf_scan, &perf_diag_ops, &perf_diag_dummy, 0220);
+MODULE_PARM_DESC(perf_scan, "Write 1 to dump CSRAM perf_state diagnostics");
+
 /* ─── MCUPM SRAM Frequency Table Scanner ────────────────────────────────── */
 /*
  * MCUPM firmware has its own frequency table in SRAM (0x0C070000, 320KB).
@@ -940,21 +1001,15 @@ module_param_string(fhctl_diag, fhctl_diag_buf, sizeof(fhctl_diag_buf), 0444);
 MODULE_PARM_DESC(fhctl_diag, "fhctl internal state dump (read-only)");
 
 /*
- * fhctl _array per-PLL data layout (reverse-engineered from mcupm_init_v1):
- *   struct fhctl_pll_data {
- *     void *domain_data;         // +0x00  (8B) — pointer to domain_ops/data
- *     u64   flags_or_count;      // +0x08  (8B) — e.g. 0x0E = PLL count?
- *     void __iomem *fhctl_base;  // +0x10  (8B) — FHCTL register base (ioremapped)
- *     void __iomem *pll_base;    // +0x18  (8B) — PLL register base (ioremapped)
- *     void *hopping_fn;          // +0x20  (8B) — hopping function pointer (internal)
- *     u32   perms;               // +0x28  (4B) — permissions mask from DTS
- *     u32   fh_id;               // +0x2C  (4B) — fh-id from DTS
- *     ... more fields
- *   };
- * Size per entry ≈ 0x90 bytes (confirmed from umaddl x14, w24, 0x90 in hopping code).
+ * fhctl _array points to a flat table of per-PLL records.
+ * On this MT6897 build the records are 0x50 bytes apart in memory.
+ * qword[0] is a dynamic private-data pointer in module memory and is the
+ * best candidate for mcupm_hopping_v1 x0. Passing the record base itself
+ * caused an alignment fault inside mcupm_hopping_v1.
  *
- * _array is a flat array of pointers: _array[domain_idx] → array of per-PLL structs
- * For MCU domains, each domain has exactly 1 PLL, so _array[mcu_domain_idx] → pll_data.
+ * _array is a flat array of per-PLL records by DTS map order. For MCU
+ * domains, each domain has exactly 1 PLL, so indices 9-13 map directly to
+ * buspll/cpu0pll/cpu1pll/cpu2pll/ptppll.
  *
  * Domain assignment in fhctl_probe -> fhctl_init:
  *   map0 "top"  → ap      PLLs (mpll=fh2, mmpll=fh3, mainpll=fh4, etc)
@@ -991,47 +1046,42 @@ static int set_fhctl_diag(const char *val, const struct kernel_param *kp)
 			"mcupm_hop=%px ap_hop=%px _array=%px | ",
 			fn_mcupm_hopping, fn_ap_hopping, (void *)fhctl_array_sym);
 
-	/* Scan _array as 64-bit pointer array (up to 64 entries) and
-	 * dump non-NULL entries with their per-PLL data fields.
+	/*
+	 * _array is a POINTER variable in fhctl BSS — dereference once
+	 * to get the actual array base.  Each per-PLL struct is 80 bytes
+	 * (10 qwords).  14 PLLs total (from ctrl output).
 	 */
+#define FHCTL_STRUCT_SIZE   80  /* bytes per PLL entry */
+#define FHCTL_STRUCT_QWORDS (FHCTL_STRUCT_SIZE / 8)
+#define FHCTL_MAX_PLLS      14
 	if (fhctl_array_sym) {
-		u64 *arr64 = (u64 *)fhctl_array_sym;
+		u64 actual_base = *(u64 *)fhctl_array_sym;
 
-		for (i = 0; i < 64 && pos < FHCTL_DIAG_BUF_SIZE - 200; i++) {
-			u64 *pd;
-			u64 hop_fn;
-			u32 perms, fh_id_val;
-			void __iomem *fhctl_base, *pll_reg_base;
+		pos += snprintf(fhctl_diag_buf + pos, FHCTL_DIAG_BUF_SIZE - pos,
+				"array_ptr=%px | ", (void *)actual_base);
 
-			if (arr64[i] == 0)
-				continue;
+		if (actual_base) {
+			u64 *base64 = (u64 *)actual_base;
 
-			pd = (u64 *)arr64[i];
+			for (i = 0; i < FHCTL_MAX_PLLS &&
+			     pos < FHCTL_DIAG_BUF_SIZE - 200; i++) {
+				u64 *pd = base64 + i * FHCTL_STRUCT_QWORDS;
+				u32 perms = (u32)(pd[5] >> 32);
+				u32 fh_id_val = (u32)pd[5];
 
-			/* Read key fields from per-PLL data structure */
-			fhctl_base = (void __iomem *)pd[2]; /* +0x10 */
-			pll_reg_base = (void __iomem *)pd[3]; /* +0x18 */
-			hop_fn = pd[4]; /* +0x20 hopping function ptr (or internal ops) */
-			perms = (u32)(pd[5] >> 32); /* +0x2C (high 32 of qword at +0x28) */
-			fh_id_val = (u32)pd[5];     /* +0x28 (low 32) */
-
-			pos += snprintf(fhctl_diag_buf + pos,
-				FHCTL_DIAG_BUF_SIZE - pos,
-				"[%d] @%px fh=%px pll=%px hop=%px p=%x id=%u | ",
-				i, (void *)arr64[i], fhctl_base,
-				pll_reg_base, (void *)hop_fn, perms, fh_id_val);
-
-			/* Verbose: dump first 12 qwords of this entry */
-			if (pos < FHCTL_DIAG_BUF_SIZE - 250) {
-				int j;
 				pos += snprintf(fhctl_diag_buf + pos,
-					FHCTL_DIAG_BUF_SIZE - pos, "raw: ");
-				for (j = 0; j < 12 && pos < FHCTL_DIAG_BUF_SIZE - 24; j++)
+					FHCTL_DIAG_BUF_SIZE - pos,
+					"[%d]@%px hop=%px p=%x id=%u hdlr=%px | ",
+					i, (void *)pd, (void *)pd[4],
+					perms, fh_id_val, (void *)pd[9]);
+
+				if (i >= 9 && pos < FHCTL_DIAG_BUF_SIZE - 180)
 					pos += snprintf(fhctl_diag_buf + pos,
 						FHCTL_DIAG_BUF_SIZE - pos,
-						"%016llx ", pd[j]);
-				pos += snprintf(fhctl_diag_buf + pos,
-					FHCTL_DIAG_BUF_SIZE - pos, "|| ");
+						"q0=%px q2=%px q3=%px q7=%px q8=%px | ",
+						(void *)pd[0], (void *)pd[2],
+						(void *)pd[3], (void *)pd[7],
+						(void *)pd[8]);
 			}
 		}
 
@@ -1067,8 +1117,9 @@ static int __nocfi set_mcupm_hop(const char *val, const struct kernel_param *kp)
 	char tmp[64], *p1, *p2, *p3;
 	unsigned long arr_idx = 0, fh_id_l = 0, dds_l = 0;
 	long postdiv_l = -1;
-	u64 *arr64;
+	u64 *pd;
 	void *pll_data;
+	void *priv_data;
 	int ret;
 
 	memset(mcupm_hop_buf, 0, sizeof(mcupm_hop_buf));
@@ -1125,23 +1176,96 @@ static int __nocfi set_mcupm_hop(const char *val, const struct kernel_param *kp)
 		return -EINVAL;
 	}
 
-	arr64 = (u64 *)fhctl_array_sym;
-	pll_data = (void *)arr64[arr_idx];
-	if (!pll_data) {
+	/*
+	 * _array is a pointer variable; dereference to get actual AP flat array.
+	 * Each per-PLL record is 80 bytes (10 qwords):
+	 *   arr[0..6]  = AP PLLs (mpll, mmpll, mainpll, msdcpll, adsppll, imgpll, tvdpll)
+	 *   arr[7..8]  = GPU PLLs (mfg-ao-mfgpll, mfgsc-ao-mfgscpll)
+	 *   arr[9..13] = MCU PLLs (buspll/mcu0, cpu0pll/mcu1, cpu1pll/mcu2,
+	 *                          cpu2pll/mcu3=P-cluster, ptppll/mcu4)
+	 *
+	 * qword[9] (offset 0x48) = link_block ptr == Hdlr from fhctl debugfs ctrl.
+	 * link_block[0] = ops_struct = actual priv_data (x0) for mcupm_hopping_v1.
+	 *
+	 * Verified from runtime analysis:
+	 *   cpu2pll (arr[12]): link_block = 0xffffff80095f0380,
+	 *                      ops_struct  = 0xffffff80095f07c0
+	 */
+	{
+		u64 actual_base = *(u64 *)fhctl_array_sym;
+		u64 link_block_addr;
+		u8 *base8;
+
+		if (!actual_base) {
+			snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+				 "ERR: _array pointer is NULL");
+			return -ENOENT;
+		}
+		base8 = (u8 *)actual_base;
+		pd = (u64 *)(base8 + arr_idx * 80);
+		pll_data = (void *)pd;
+
+		/* pd[9] = link_block ptr (= Hdlr column in fhctl ctrl debugfs).
+		 * Dereference once more to get ops_struct = actual priv_data. */
+		link_block_addr = pd[9];
+		if (!link_block_addr) {
+			snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
+				 "ERR: _array[%lu] link_block is NULL", arr_idx);
+			return -ENOENT;
+		}
+		priv_data = (void *)(*(u64 *)link_block_addr);
+	}
+	if (!pll_data || !priv_data) {
 		snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
-			 "ERR: _array[%lu] is NULL", arr_idx);
+			 "ERR: _array[%lu] record=%px priv=%px", arr_idx,
+			 pll_data, priv_data);
 		return -ENOENT;
 	}
 
-	pr_info("KPM_OC: mcupm_hop: arr[%lu]=%px fh_id=%lu dds=0x%06lx pdiv=%ld\n",
-		arr_idx, pll_data, fh_id_l, dds_l, postdiv_l);
+	pr_info("KPM_OC: mcupm_hop: arr[%lu]=%px priv=%px fh_id=%lu dds=0x%06lx pdiv=%ld\n",
+		arr_idx, pll_data, priv_data, fh_id_l, dds_l, postdiv_l);
 
-	ret = fn_mcupm_hopping(pll_data, NULL, (int)fh_id_l,
-			       (unsigned int)dds_l, (int)postdiv_l);
+	/* Domain name pointer for mcupm_hopping_v1 arg1.
+	 *
+	 * find_entry() uses POINTER comparison (not strcmp) to search the
+	 * ops_struct domain_head list.  We must pass the exact fhctl-internal
+	 * name pointer from domain_head[k].name_ptr (k = arr_idx - 9 for MCU).
+	 *
+	 * ops_struct layout (relevant fields):
+	 *   [0x00] = pll_data ptr
+	 *   [0x08] = spinlock
+	 *   [0x10] = hw_ctx
+	 *   [0x28] = domain_head ptr → array of {name_ptr, fh_id_base} entries
+	 *
+	 * For AP PLLs (arr_idx 0-8):  domain_head = NULL → arg1 unused.
+	 * For MCU PLLs (arr_idx 9-13): domain_head != NULL → must use exact ptr.
+	 * Entry ordering in domain_head matches arr_idx order: k = arr_idx - 9.
+	 */
+	{
+		u64 *ops = (u64 *)priv_data;
+		u64  dom_head_va = ops[5];  /* ops_struct[0x28] = ops[5] */
+		const char *domain;
+
+		if (dom_head_va && arr_idx >= 9 && arr_idx <= 13) {
+			int k = (int)arr_idx - 9;
+			u64 *dom_head = (u64 *)dom_head_va;
+			/* Each entry is 16 bytes: {name_ptr, fh_id_base} */
+			domain = (const char *)dom_head[k * 2];
+			pr_info("KPM_OC: mcupm_hop dom_head=%px k=%d name_ptr=%px\n",
+				(void *)dom_head_va, k, domain);
+		} else {
+			/* AP PLL or no domain_head: fallback string (not searched) */
+			domain = "top";
+		}
+
+		ret = fn_mcupm_hopping(priv_data, domain, (int)fh_id_l,
+				       (unsigned int)dds_l, (int)postdiv_l);
+	}
 
 	snprintf(mcupm_hop_buf, MCUPM_HOP_BUF_SIZE,
-		 "arr[%lu]=%px fh=%lu dds=0x%06lx pdiv=%ld → ret=%d",
-		 arr_idx, pll_data, fh_id_l, dds_l, postdiv_l, ret);
+		 "arr[%lu]=%px link_blk=%px ops=%px fh=%lu dds=0x%06lx pdiv=%ld ret=%d",
+		 arr_idx, pll_data, (void *)pd[9], priv_data,
+		 fh_id_l, dds_l, postdiv_l, ret);
 
 	pr_info("KPM_OC: mcupm_hop result: %s\n", mcupm_hop_buf);
 	return 0;
@@ -1686,6 +1810,8 @@ static int fhctl_cap_pos;
 
 static int __nocfi fhctl_hop_kp_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	void *priv_data = (void *)regs->regs[0];
+	const void *domain_ptr = (const void *)regs->regs[1];
 	unsigned int fh_id = (unsigned int)regs->regs[2];
 	unsigned int new_dds = (unsigned int)regs->regs[3];
 	unsigned int postdiv = (unsigned int)regs->regs[4];
@@ -1696,11 +1822,11 @@ static int __nocfi fhctl_hop_kp_pre(struct kprobe *p, struct pt_regs *regs)
 
 	fhctl_cap_pos += snprintf(fhctl_cap_buf + fhctl_cap_pos,
 				  FHCTL_CAP_BUF_SIZE - fhctl_cap_pos,
-				  "hop fh_id=%u dds=0x%08x pdiv=%u | ",
-				  fh_id, new_dds, postdiv);
+				  "hop priv=%px dom=%px fh_id=%u dds=0x%08x pdiv=%u | ",
+				  priv_data, domain_ptr, fh_id, new_dds, postdiv);
 
-	pr_info_ratelimited("KPM_OC: FH hop fh_id=%u dds=0x%08x pdiv=%u\n",
-			    fh_id, new_dds, postdiv);
+	pr_info_ratelimited("KPM_OC: FH hop priv=%px dom=%px fh_id=%u dds=0x%08x pdiv=%u\n",
+			    priv_data, domain_ptr, fh_id, new_dds, postdiv);
 	return 0;
 }
 
@@ -1817,6 +1943,34 @@ static const struct kernel_param_ops fhctl_oc_ops = { .set = set_fhctl_oc };
 static int fhctl_oc_dummy;
 module_param_cb(fhctl_oc, &fhctl_oc_ops, &fhctl_oc_dummy, 0220);
 MODULE_PARM_DESC(fhctl_oc, "FHCTL IPI OC: write fh_id,dds_hex[,postdiv]");
+
+/* ─── fhctl has_perms patch ─────────────────────────────────────────────── */
+/*
+ * Unlock fhctl debugfs ctrl interface by setting has_perms = 1.
+ * This allows PLL hopping via:  echo "cpu2pll hopping 0xDDS" > /sys/kernel/debug/fhctl/ctrl
+ */
+static int set_fhctl_unlock(const char *val, const struct kernel_param *kp)
+{
+	unsigned long sym;
+
+	if (!kln_func && resolve_kallsyms())
+		return -ENOENT;
+
+	sym = kln_func("has_perms");
+	if (!sym) {
+		pr_err("KPM_OC: fhctl has_perms symbol not found\n");
+		return -ENOENT;
+	}
+
+	*(u32 *)sym = 1;
+	pr_info("KPM_OC: fhctl has_perms@%px set to 1\n", (void *)sym);
+	return 0;
+}
+
+static const struct kernel_param_ops fhctl_unlock_ops = { .set = set_fhctl_unlock };
+static int fhctl_unlock_dummy;
+module_param_cb(fhctl_unlock, &fhctl_unlock_ops, &fhctl_unlock_dummy, 0220);
+MODULE_PARM_DESC(fhctl_unlock, "Write 1 to unlock fhctl debugfs ctrl");
 
 static void cpu_reapply_volt_overrides_locked(void)
 {
@@ -2020,13 +2174,13 @@ static int          cpu_volt_ov_count;
 static unsigned int cpu_orig_volt[NUM_CLUSTERS][LUT_MAX_ENTRIES];
 
 /* Configurable via module params */
-static unsigned int gpu_target_freq = 1500000;
+static unsigned int gpu_target_freq = 1900000;
 module_param(gpu_target_freq, uint, 0644);
-MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq in KHz (default 1500000; GPUEB stock max ~1400000)");
+MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq in KHz (default 1900000; hardware PLL max, signed OPP[0] OPP[0])");
 
-static unsigned int gpu_target_volt = 105000;
+static unsigned int gpu_target_volt = 115040;
 module_param(gpu_target_volt, uint, 0644);
-MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt in 10µV steps (default 105000 = 1050mV)");
+MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt in 10µV steps (default 115040 = 1150.4mV; matches signed OPP[0]mV; matches signed OPP[0])");
 
 static unsigned int gpu_target_vsram = 95000;
 module_param(gpu_target_vsram, uint, 0644);
@@ -2079,7 +2233,8 @@ static void gpu_pll_set_freq(unsigned int tar_freq_khz)
 {
 	unsigned int postdiv_pow;
 	u64 vco_khz;
-	u32 pcw, con1;
+	u32 pcw, con1, readback;
+	static unsigned long last_log_jiffies;
 
 	if (!mfg_pll_virt)
 		return;
@@ -2103,6 +2258,28 @@ static void gpu_pll_set_freq(unsigned int tar_freq_khz)
 	writel(con1, mfg_pll_virt + MFG_PLL_CON1_OFF);
 	if (mfgsc_pll_virt)
 		writel(con1, mfgsc_pll_virt + MFG_PLL_CON1_OFF);
+
+	/* Readback to check GPUEB hasn't actually changed the target frequency.
+	 * GPUEB periodically clears bit31 (PCW_CHG/lock flag) as part of its
+	 * normal lifecycle, but leaves the PCW (frequency divider) unchanged.
+	 * Only log "FREQ_CHANGED" if GPUEB actually modified the PCW/postdiv.
+	 */
+	readback = readl(mfg_pll_virt + MFG_PLL_CON1_OFF);
+	if (time_after(jiffies, last_log_jiffies + msecs_to_jiffies(2000))) {
+		unsigned int rb_pcw = readback & 0x3FFFFF;
+		unsigned int rb_pdiv = (readback >> 24) & 0x7;
+		u64 rb_vco = (u64)rb_pcw * GPU_FIN_KHZ;
+		unsigned int rb_freq = (unsigned int)(rb_vco >> (GPU_PCW_FRAC_BITS + rb_pdiv));
+		/* Compare only PCW + postdiv (freq-determining bits), not bit31 (update flag) */
+		bool freq_ok = ((readback & 0x07FFFFFF) == (con1 & 0x07FFFFFF));
+
+		pr_info("KPM_OC: gpu_pll: wrote con1=0x%08x (%uKHz) readback=0x%08x (%uKHz) %s%s\n",
+			con1, tar_freq_khz, readback, rb_freq,
+			freq_ok ? "freq_ok" : "FREQ_CHANGED_BY_GPUEB",
+			(!freq_ok) ? "" :
+			  ((readback >> 31) & 1) ? " lock=1" : " lock=0(GPUEB_cleared_flag)");
+		last_log_jiffies = jiffies;
+	}
 }
 
 /* kretprobe on gpufreq_commit (wrapper exported symbol).
@@ -2122,6 +2299,8 @@ static int __nocfi gpu_commit_kretp_entry(struct kretprobe_instance *ri,
 	return 0;
 }
 
+static atomic_t gpu_pll_override_count = ATOMIC_INIT(0);
+
 static int __nocfi gpu_commit_kretp_ret(struct kretprobe_instance *ri,
 					struct pt_regs *regs)
 {
@@ -2135,8 +2314,10 @@ static int __nocfi gpu_commit_kretp_ret(struct kretprobe_instance *ri,
 	 * 2) OPP was 0 (max freq)
 	 * 3) target freq exceeds stock max
 	 */
-	if (ret_val == 0 && d->oppidx == 0 && tgt > GPU_STOCK_MAX_KHZ)
+	if (ret_val == 0 && d->oppidx == 0 && tgt > GPU_STOCK_MAX_KHZ) {
 		gpu_pll_set_freq(tgt);
+		atomic_inc(&gpu_pll_override_count);
+	}
 
 	return 0;
 }
@@ -2152,6 +2333,89 @@ static struct kretprobe gpu_commit_kretp = {
 static char gpu_oc_result[GPU_RESULT_BUF_SIZE];
 module_param_string(gpu_oc_result, gpu_oc_result, sizeof(gpu_oc_result), 0444);
 MODULE_PARM_DESC(gpu_oc_result, "Result of last GPU OC patch operation");
+
+/* gpu_pll_diag: read MFG PLL CON1 register and compute actual GPU clock.
+ * Also shows MFGSC PLL CON1 for cross-validation.
+ * con1 [31]=PCW_CHG, [26:24]=POSTDIV_POW, [21:0]=PCW
+ * freq_khz = (pcw * 26000) >> (14 + postdiv_pow)
+ */
+static int get_gpu_pll_diag(char *buf, const struct kernel_param *kp)
+{
+	u32 mfg_con1 = 0, mfgsc_con1 = 0;
+	unsigned int pcw, postdiv_pow, freq_khz;
+	u64 vco_khz;
+
+	if (!mfg_pll_virt)
+		return scnprintf(buf, PAGE_SIZE, "ERR:no_ioremap\n");
+
+	mfg_con1 = readl(mfg_pll_virt + MFG_PLL_CON1_OFF);
+	if (mfgsc_pll_virt)
+		mfgsc_con1 = readl(mfgsc_pll_virt + MFG_PLL_CON1_OFF);
+
+	pcw        = mfg_con1 & 0x3FFFFF;
+	postdiv_pow = (mfg_con1 >> 24) & 0x7;
+	vco_khz    = (u64)pcw * GPU_FIN_KHZ;
+	freq_khz   = (unsigned int)(vco_khz >> (GPU_PCW_FRAC_BITS + postdiv_pow));
+
+	return scnprintf(buf, PAGE_SIZE,
+			 "mfg_con1=0x%08x pcw=0x%06x postdiv=%u freq=%uKHz"
+			 " mfgsc_con1=0x%08x tgt=%u overrides=%d\n",
+			 mfg_con1, pcw, postdiv_pow, freq_khz,
+			 mfgsc_con1, READ_ONCE(gpu_target_freq),
+			 atomic_read(&gpu_pll_override_count));
+}
+
+static const struct kernel_param_ops gpu_pll_diag_ops = {
+	.get = get_gpu_pll_diag,
+};
+static int gpu_pll_diag_dummy;
+module_param_cb(gpu_pll_diag, &gpu_pll_diag_ops, &gpu_pll_diag_dummy, 0444);
+MODULE_PARM_DESC(gpu_pll_diag, "Read MFG PLL CON1 and compute actual GPU clock frequency");
+
+/*
+ * gpu_pll_force_khz: write a frequency (KHz) to directly program MFG PLL CON1
+ * without waiting for GPU load / kretprobe.  Used to diagnose PLL behaviour.
+ *
+ * SAFETY: Writing the PLL at a frequency higher than the active voltage level
+ * allows (e.g. 1600 MHz at 1.05V) will crash the device.  This write is
+ * rejected unless the target frequency is <= gpu_target_freq (which is the
+ * value for which the OPP table voltage has been set).  To bypass this
+ * gating set gpu_pll_force_unsafe=1 first (diagnostic only, crash risk).
+ */
+static bool gpu_pll_force_unsafe;
+module_param(gpu_pll_force_unsafe, bool, 0644);
+MODULE_PARM_DESC(gpu_pll_force_unsafe, "Allow gpu_pll_force_khz above gpu_target_freq (UNSAFE, crash risk)");
+
+static int set_gpu_pll_force(const char *val, const struct kernel_param *kp)
+{
+	unsigned long freq_khz;
+	int ret = kstrtoul(val, 10, &freq_khz);
+
+	if (ret)
+		return ret;
+	if (freq_khz == 0 || freq_khz > GPU_PLL_MAX_KHZ)
+		return -ERANGE;
+
+	/* Reject if requested freq exceeds the voltage-matched target, unless
+	 * the user has explicitly acknowledged the crash risk.
+	 */
+	if (!gpu_pll_force_unsafe && freq_khz > READ_ONCE(gpu_target_freq)) {
+		pr_warn("KPM_OC: gpu_pll_force: %lu KHz > gpu_target_freq=%u; set gpu_pll_force_unsafe=1 to override\n",
+			freq_khz, READ_ONCE(gpu_target_freq));
+		return -EPERM;
+	}
+
+	gpu_pll_set_freq((unsigned int)freq_khz);
+	pr_info("KPM_OC: gpu_pll_force: wrote %lu KHz to MFG PLL CON1\n", freq_khz);
+	return 0;
+}
+
+static const struct kernel_param_ops gpu_pll_force_ops = {
+	.set = set_gpu_pll_force,
+};
+static int gpu_pll_force_dummy;
+module_param_cb(gpu_pll_force_khz, &gpu_pll_force_ops, &gpu_pll_force_dummy, 0220);
+MODULE_PARM_DESC(gpu_pll_force_khz, "Write KHz to directly program MFG PLL (must be <= gpu_target_freq unless gpu_pll_force_unsafe=1)");
 
 /*
  * Runtime patch strategy:
