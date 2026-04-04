@@ -1,6 +1,6 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v7.6) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (v8.0) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 - **CPU OPP reader** — exports CSRAM LUT data to userspace via live sysfs reads (re-reads CSRAM on every access)
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
@@ -9,8 +9,11 @@ Kernel module (v7.6) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 - **GPU overclocking** — patches the GPU default + working OPP tables in kernel memory at runtime
 - **GPU per-OPP voltage override** — direct memory write for any OPP entry, bypassing vendor `fix_custom_freq_volt` validation
 - **GPUEB OPP countermeasure** *(v7.2)* — kprobe on the GPU DVFS commit function re-patches OPP voltages immediately before the commit reads them, preventing GPUEB firmware from reverting OC voltage
+- **GPU PLL direct programming** *(v8.0)* — direct MFG PLL CON1 register writes for above-stock GPU frequency; kretprobe on `gpufreq_commit` reprograms PLL after GPUEB commits
+- **FHCTL / MCU PLL hopping** *(v8.0)* — IPI-based PLL frequency control via MCUPM fhctl interface; captures `mcupm_hopping_v1` calls for diagnostics
+- **SCMI DVFS capture & override** *(v8.0)* — kprobes on `scmi_perf_level_set` / `scmi_dvfs_freq_set` for diagnostics and optional performance level override
 
-Used by the [APatch module (v8.0)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, persistent configuration, and a boot-time service with gaming monitor daemon.
+Used by the [APatch module (v8.0)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, persistent configuration, and a boot-time service with gaming monitor daemon.
 
 ## Hardware Details
 
@@ -22,6 +25,7 @@ Used by the [APatch module (v8.0)](https://github.com/zerofrip/Headwolf_F8_KPM_O
 | DTB Node | `cpuhvfs@114400` — reg[1] is the CSRAM region |
 | CPU Driver | `mtk-cpufreq-hw` (performance-controller LUT) |
 | GPU Driver | `mtk_gpufreq_mt6897` + `mtk_gpufreq_wrapper` + GPUEB |
+| MFG PLL Base | `0x13FA0000` (MFGSC: `0x13FA0C00`) |
 
 ### CPU Clusters
 
@@ -55,7 +59,7 @@ Each GPU OPP entry is 24 bytes (stride in `g_gpu_default_opp_table` / working ta
 
 ```text
 u32 freq;     // KHz
-u32 volt;     // 10µV steps (e.g. 87500 = 875.0 mV)
+u32 volt;     // 10µV steps (e.g. 115040 = 1150.4 mV)
 u32 vsram;    // 10µV steps
 u32 posdiv;
 u32 vaging;
@@ -77,16 +81,20 @@ A 500 ms periodic relift cannot keep up with these firmware write-backs.
 
 ### Solution: Event-Driven Resync via kprobes
 
-Instead of polling, v7.2 installs kprobes that fire on the exact functions called during DVFS transitions.
-All 5 kprobes are registered at module init:
+Instead of polling, v7.2+ installs kprobes that fire on the exact functions called during DVFS transitions.
+All kprobes are registered at module init:
 
-| kprobe symbol | Module | Purpose |
-|---------------|--------|---------|
-| `freq_qos_update_request` | core kernel | Intercept vendor freq_qos MAX lowering calls; silently raise argument to OC target so vendor constraints cannot clamp the OC ceiling |
-| `update_userlimit_cpufreq_max` | platform driver | Intercept powerhal / touch_boost calls that restore the stock CPU max; raise the argument to the OC target |
-| `mtk_cpufreq_hw_fast_switch` | `mediatek_cpufreq_hw` | Re-patch CSRAM LUT voltages before fast-switch path |
-| `mtk_cpufreq_hw_target_index` | `mediatek_cpufreq_hw` | Re-patch CSRAM LUT voltages before target-index path |
-| `__gpufreq_generic_commit_gpu` | `mtk_gpufreq_mt6897` | Re-patch GPU default + working OPP[0] before commit reads them |
+| kprobe symbol | Type | Module | Purpose |
+|---------------|------|--------|---------|
+| `freq_qos_update_request` | kprobe | core kernel | Intercept vendor freq_qos MAX lowering calls; silently raise argument to OC target so vendor constraints cannot clamp the OC ceiling |
+| `update_userlimit_cpufreq_max` | kprobe | platform driver | Intercept powerhal / touch_boost calls that restore the stock CPU max; raise the argument to the OC target |
+| `scmi_cpufreq_fast_switch` | kprobe | `scmi_cpufreq` | Re-patch CSRAM LUT voltages before fast-switch path |
+| `scmi_cpufreq_set_target` | kprobe | `scmi_cpufreq` | Re-patch CSRAM LUT voltages before target-index path |
+| `__gpufreq_generic_commit_gpu` | kprobe | `mtk_gpufreq_mt6897` | Re-patch GPU default + working OPP[0] before commit reads them |
+| `gpufreq_commit` | kretprobe | `mtk_gpufreq_mt6897` | Reprogram MFG PLL CON1 after GPUEB commits above-stock OC freq |
+| `mcupm_hopping_v1` | kprobe | `mtk_fhctl` | Capture MCU PLL DDS changes via IPI for diagnostics |
+| `scmi_perf_level_set` | kprobe | `scmi_perf` | Capture / override SCMI DVFS performance levels |
+| `scmi_dvfs_freq_set` | kprobe | `scmi_dvfs` | Capture SCMI DVFS frequency set requests |
 
 The pre-handler for each CPU DVFS kprobe calls `cpu_csram_resync_fast()`, which writes OC voltages to CSRAM for all clusters nanoseconds before the HW reads `REG_FREQ_PERF_STATE`. The GPU kprobe pre-handler re-patches `default_table[0]` and `working_table[0]` before `__gpufreq_generic_commit_gpu` dereferences them.
 
@@ -94,7 +102,7 @@ The 500 ms periodic relift worker is kept as a safety net for edge cases.
 
 ### Verified Results
 
-After loading v7.2 with OC targets (L=3800 MHz, B=3800 MHz, P=3800 MHz, GPU=3000 MHz):
+After loading with OC targets (L=3800 MHz, B=3800 MHz, P=3800 MHz, GPU=3000 MHz):
 
 | Metric | Before v7.2 | After v7.2 |
 |--------|-------------|------------|
@@ -158,9 +166,9 @@ echo clear > /sys/module/kpm_oc/parameters/cpu_volt_override
 
 | Parameter | Access | Description |
 |-----------|--------|-------------|
-| `gpu_target_freq` | RW | GPU OPP[0] target freq in KHz (default `1450000`) |
-| `gpu_target_volt` | RW | GPU OPP[0] target voltage in 10µV steps (default `87500`) |
-| `gpu_target_vsram` | RW | GPU OPP[0] target vsram in 10µV steps (default `87500`) |
+| `gpu_target_freq` | RW | GPU OPP[0] target freq in KHz (default `1900000`) |
+| `gpu_target_volt` | RW | GPU OPP[0] target voltage in 10µV steps (default `115040` = 1150.4 mV) |
+| `gpu_target_vsram` | RW | GPU OPP[0] target vsram in 10µV steps (default `95000` = 950.0 mV) |
 | `gpu_oc_apply` | W | Write `1` to re-apply GPU OC |
 | `gpu_oc_result` | R | Result string: `OK:patched=3,freq=...` or `FAIL:...` |
 
@@ -200,114 +208,88 @@ echo clear > /sys/module/kpm_oc/parameters/gpu_volt_override
 cat /proc/gpufreqv2/gpu_working_opp_table | head -5
 ```
 
-Overrides are persisted by the GPU relift kthread (500 ms interval), so they survive GPU power-cycles and vendor-side runtime table refreshes.
+### GPU PLL Direct Programming (v8.0)
 
-## Building
+| Parameter | Access | Description |
+|-----------|--------|-------------|
+| `gpu_pll_diag` | R | Read MFG PLL CON1 and compute current frequency |
+| `gpu_pll_force_khz` | W | Write KHz to directly program MFG PLL CON1 register |
+| `gpu_pll_force_unsafe` | RW | Bool: allow PLL writes above `gpu_target_freq` (crash risk without matching voltage) |
 
-Requires Android GKI kernel source (`android14-6.1` branch) and Android Clang r487747c (17.0.2).
-This device has `CONFIG_CFI_CLANG=y`; other Clang versions may cause a CFI failure at `insmod`.
+> **Warning**: Writing `gpu_pll_force_khz` above the voltage-matched frequency range without `gpu_pll_force_unsafe=1` will be rejected. Even with the unsafe flag, writing a frequency that exceeds the voltage headroom can cause an immediate GPU hang or device reboot.
 
-### Recommended: `build.sh`
+### FHCTL / MCU PLL (v8.0)
+
+| Parameter | Access | Description |
+|-----------|--------|-------------|
+| `fhctl_scan` | W | Dump fhctl internal `_array` state (AP + MCU PLLs) |
+| `fhctl_oc` | W | FHCTL IPI OC: write `fh_id,dds_hex[,postdiv]` |
+| `fhctl_unlock` | W | Unlock fhctl debugfs `ctrl` interface |
+| `fhctl_capture` | R | Last captured `mcupm_hopping_v1` calls |
+| `mcupm_hop` | W | Call `mcupm_hopping_v1`: write `array_idx,fh_id,dds[,postdiv]` |
+
+### MCUPM SRAM / DRAM Diagnostics (v8.0)
+
+| Parameter | Access | Description |
+|-----------|--------|-------------|
+| `mcupm_scan_trigger` | W | Search MCUPM SRAM/DRAM for frequency tables |
+| `mcupm_hexdump` | W | Hex dump MCUPM memory at offset |
+| `mcupm_dram_write` | W | Write DRAM: `offset,value_hex` |
+
+### SCMI DVFS Diagnostics (v8.0)
+
+| Parameter | Access | Description |
+|-----------|--------|-------------|
+| `scmi_capture` | R | Captured SCMI DVFS calls from kprobes |
+| `scmi_override` | W | Override SCMI perf level: write `domain,level` (`0` to clear) |
+
+### PLL / Performance Diagnostics (v8.0)
+
+| Parameter | Access | Description |
+|-----------|--------|-------------|
+| `pll_scan` | W | Dump MCU PLL CON0-3, FHCTL registers |
+| `perf_scan` | W | Dump CSRAM `perf_state` + `hw_state` per domain |
+| `kvm_read_trigger` | W | Read 256 bytes at a kernel virtual address (debug) |
+
+## Build
+
+### Requirements
+
+- Android GKI 6.1 kernel source (`android14-6.1` branch, `common/` directory)
+- Android Clang r487747c (17.0.2) — **required** for `CONFIG_CFI_CLANG=y` compatibility
+- `ARCH=arm64` with `LLVM=1 LLVM_IAS=1`
+
+### Using `build.sh`
 
 ```bash
-./build.sh \
-  KERNEL_DIR=/path/to/android14-6.1/common \
-  CLANG_DIR=/path/to/clang-r487747c
-```
-
-`build.sh` validates the environment, sets PATH, and prints the `vermagic` of the resulting `.ko`.
-It also accepts env-var form: `KERNEL_DIR=... CLANG_DIR=... ./build.sh`
-
-### Kernel source preparation (one-time)
-
-The GKI source tree must be configured and prepared before any out-of-tree module build:
-
-```bash
+# Prepare kernel source
 cd /path/to/android14-6.1/common
-PATH=/path/to/clang-r487747c/bin:$PATH \
-make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+make ARCH=arm64 LLVM=1 modules_prepare
 
-PATH=/path/to/clang-r487747c/bin:$PATH \
-make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) scripts prepare modules_prepare
+# Build module
+./build.sh KERNEL_DIR=/path/to/android14-6.1/common
+# Optionally specify clang:
+./build.sh KERNEL_DIR=/path/to/android14-6.1/common CLANG_DIR=/path/to/clang-r487747c
 ```
 
-### Direct `make` invocation
+### Using Make directly
 
 ```bash
-PATH=/path/to/clang-r487747c/bin:$PATH \
-make KERNEL_DIR=/path/to/android14-6.1/common \
-     ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-     KBUILD_MODPOST_WARN=1 \
-     -j$(nproc) modules
+make ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+     KERNEL_DIR=/path/to/android14-6.1/common \
+     KBUILD_MODPOST_WARN=1
 ```
 
-> **Note:** `KBUILD_MODPOST_WARN=1` is required because `Module.symvers` is absent in the GKI tree,
-> causing `modpost` to emit unresolved symbol warnings. These are expected — symbols are resolved at
-> runtime by the device kernel. APatch's KPM loader bypasses modversion CRC checks, so this has no
-> runtime effect.
+> **Important**: The `-fsanitize=kcfi` flag is required. Without it, `insmod` will trigger a `CFI failure at do_one_initcall` and reboot the device.
 
-## Usage
+## Author
 
-```bash
-# Load module (auto-scans CPU CSRAM and auto-applies GPU OC on init)
-insmod kpm_oc.ko
-
-# Read CPU OPP table
-cat /sys/module/kpm_oc/parameters/opp_table | tr '|' '\n'
-# Example: CPU:0:2200000:831250  CPU:4:3200000:1006250  ...
-
-# CPU OC: overclock all clusters (patches LUT[0] + cpufreq policy)
-echo 2400000 > /sys/module/kpm_oc/parameters/cpu_oc_l_freq
-echo  875000 > /sys/module/kpm_oc/parameters/cpu_oc_l_volt
-echo 3300000 > /sys/module/kpm_oc/parameters/cpu_oc_b_freq
-echo 1025000 > /sys/module/kpm_oc/parameters/cpu_oc_b_volt
-echo 3600000 > /sys/module/kpm_oc/parameters/cpu_oc_p_freq
-echo 1100000 > /sys/module/kpm_oc/parameters/cpu_oc_p_volt
-echo 1 > /sys/module/kpm_oc/parameters/cpu_oc_apply
-cat /sys/module/kpm_oc/parameters/cpu_oc_result
-# L:2200000->2400000KHz@875000uV,B:3200000->3300000KHz@1025000uV,...
-
-# CPU per-LUT voltage override (any entry, bypasses stock constraints)
-echo '1:5:900000' > /sys/module/kpm_oc/parameters/cpu_volt_override
-# B cluster LUT[5]: 887500 µV → 900000 µV
-
-# GPU OC: change OPP[0] to 1450 MHz (applied automatically on load with defaults)
-echo 1450000 > /sys/module/kpm_oc/parameters/gpu_target_freq
-echo   87500 > /sys/module/kpm_oc/parameters/gpu_target_volt
-echo   87500 > /sys/module/kpm_oc/parameters/gpu_target_vsram
-echo 1 > /sys/module/kpm_oc/parameters/gpu_oc_apply
-cat /sys/module/kpm_oc/parameters/gpu_oc_result
-# OK:patched=3,freq=1400000->1450000,...
-
-# GPU per-OPP voltage override (any OPP, bypasses driver validation)
-echo '1:90000:90000' > /sys/module/kpm_oc/parameters/gpu_volt_override
-# OPP[1]: 85000 → 90000
-
-# Verify GPU working OPP table
-cat /proc/gpufreqv2/gpu_working_opp_table | head -5
-# [00] freq: 1450000, volt:  87500, vsram:  87500
-# [01] freq: 1383000, volt:  90000, vsram:  90000
-# ...
-```
-
-## Implementation Notes
-
-- **GKI compatibility**: `kallsyms_lookup_name` is resolved via kprobe (not directly exported in GKI 6.1)
-- **No hard symbol dependencies**: `cpufreq_cpu_get` / `cpufreq_cpu_put` are resolved at runtime via `kallsyms_lookup_name` — the module has zero hard dependencies on the cpufreq subsystem, ensuring safe loading at any boot stage
-- **KCFI**: Functions calling kallsyms-resolved pointers are marked `__nocfi` (includes `set_cpu_oc`, `resolve_cpufreq_symbols`, `set_gpu_volt_ov`, GPU resolve/patch functions)
-- **Early-boot race fix** *(post-v7.2)*: `cluster_qos_ptr[c]` (used by the `freq_qos_update_request` kprobe to identify per-cluster requests) is now refreshed from the live policy in every iteration of the periodic relift worker. Previously this pointer was only set inside `set_cpu_oc()`, so if that function ran before the cpufreq driver had registered policies (possible at early-boot), the kprobe would never intercept vendor stock-cap writes — leaving only the 500 ms periodic worker to fight back. With this fix, the first relift iteration that obtains a valid policy populates the pointer and the kprobe takes over immediately.
-- **MCUPM countermeasure** *(v7.2)*: kprobes on `mtk_cpufreq_hw_fast_switch` and `mtk_cpufreq_hw_target_index` (both in `[mediatek_cpufreq_hw]`) call `cpu_csram_resync_fast()` in their pre-handlers to re-write OC LUT voltages into CSRAM before every DVFS transition. The CSRAM read at an arbitrary moment may still show MCUPM-computed values for non-target OPPs; what matters is the voltage is correct at the pre-handler instant
-- **GPUEB countermeasure** *(v7.2)*: kprobe on `__gpufreq_generic_commit_gpu` (in `[mtk_gpufreq_mt6897]`) re-patches `default_table[0]` and `working_table[0]` with OC freq/volt/vsram before commit reads them. Total kprobes registered at init: 5
-- **GPU GPUEB mode**: `__gpufreq_get_working_table_gpu()` returns NULL when GPU is powered off; the module falls back to `gpufreq_get_working_table(0)` (wrapper public API) which reads `g_shared_status` — always CPU-accessible
-- **GPU relift**: the GPU kthread runs for the module lifetime and re-applies all GPU table patches (OPP[0] OC + per-OPP voltage overrides) every 500 ms, keeping OC active through GPU power-cycles and vendor runtime refreshes
-- **kthread safety**: the GPU relift kthread exits only via `kthread_stop()` to prevent UAF on `rmmod`
-- **CPU OC mechanism**: Writes new LUT entry (freq + volt, preserving gear-selector bits) to CSRAM, then updates `cpufreq_policy` freq_table[0] (always index 0, the highest OPP in descending LUT), `policy->max`, and `cpuinfo.max_freq` so the governor can target the new ceiling. The freq_table[0] direct update ensures correct re-OC after underclock (previously, a max-search loop selected the wrong index when index 0 held the underclocked value)
-- **CPU voltage override**: Writes directly to CSRAM LUT entries via `writel_relaxed`, preserving gear-selector and frequency bits. Original values are saved on first override and restored on `clear`
-- **GPU voltage override**: Patches both `g_gpu_default_opp_table` and working table entries in kernel memory, bypassing the vendor `fix_custom_freq_volt` function which rejects writes when DVFSState validation fails (GPU powered off, volt clamp). Original values are saved on first override and restored on `clear`
-- **Boot-time OC**: When loaded with nonzero `cpu_oc_*_freq` params (e.g. from APatch service.sh), CPU OC is auto-applied during `kpm_oc_init`
-- **Live sysfs reads** *(v7.6)*: `opp_table` and `raw` parameters use `module_param_cb` with `.get` callbacks that call `__scan_csram_lut_locked()` on every sysfs read, returning current CSRAM data without requiring an explicit `apply` write. The shared scan helper is also used by `set_apply()` to avoid duplicated logic
-- **GPU max reporting caveat**: some generic kernel-manager apps still show the stock 1400 MHz ceiling because they read devfreq `max_freq`; verify effective GPU OC via `/proc/gpufreqv2/gpu_working_opp_table` and `gpu_oc_result`
+**zerofrip** — [github.com/zerofrip](https://github.com/zerofrip)
 
 ## License
 
-GPL-2.0
+This project is licensed under **GPL-2.0** — see the [SPDX identifier](https://spdx.org/licenses/GPL-2.0-only.html) in the source header.
+
+```
+// SPDX-License-Identifier: GPL-2.0
+```
