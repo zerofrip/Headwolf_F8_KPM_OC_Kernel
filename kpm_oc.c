@@ -24,6 +24,14 @@
  *         - __gpufreq_generic_commit_gpu
  *           (re-patches GPU OPP tables before commit reads them)
  *         Periodic relift retained as safety net only.
+ *   v7.6: Bug fixes and sysfs improvements.
+ *         - opp_table / raw sysfs params: converted from static
+ *           module_param_string to module_param_cb with .get callbacks
+ *           that re-read CSRAM on every sysfs read (live data, no
+ *           'apply' write required).
+ *         - set_cpu_oc freq_table update: always writes tbl[0].frequency
+ *           instead of searching for the max-freq entry. Fixes re-OC
+ *           after underclock where index 0 held the underclocked value.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -145,40 +153,37 @@ static const unsigned int pll_offsets[] = { 0x400, 0x800, 0xC00 }; /* L, B, P */
 /* OPP table: CPU:<policy>:<freq_khz>:<volt_uv>|...  */
 #define OPP_BUF_SIZE      8192
 static char opp_table_export[OPP_BUF_SIZE];
-module_param_string(opp_table, opp_table_export, sizeof(opp_table_export), 0444);
-MODULE_PARM_DESC(opp_table, "CPU OPP table (CPU:policy:freq_khz:volt_uv|...)");
 
 /* Raw hex dump for debugging: first 8 LUT entries per domain */
 #define RAW_BUF_SIZE      4096
 static char raw_dump[RAW_BUF_SIZE];
-module_param_string(raw, raw_dump, sizeof(raw_dump), 0444);
-MODULE_PARM_DESC(raw, "Raw hex dump of LUT entries for debugging");
 
 static DEFINE_MUTEX(lock);
 static void __iomem *csram_base;
 
-/* ─── Scan CSRAM and Export CPU Freq Table ──────────────────────────────── */
+/* ─── Dynamic sysfs readers for opp_table and raw ──────────────────────── */
 
-static int set_apply(const char *val, const struct kernel_param *kp)
+/*
+ * Shared helper: scan CSRAM LUT and populate opp_table_export[] + raw_dump[].
+ * Called from both set_apply() and the dynamic .get callbacks.
+ * Caller must hold lock.
+ */
+static void __scan_csram_lut_locked(void)
 {
 	int c, i;
 	char buf[96];
 	int opp_pos = 0;
 	int raw_pos = 0;
 
-	if (!csram_base) {
-		pr_err("KPM_OC: CSRAM not mapped\n");
-		return -ENOMEM;
-	}
+	if (!csram_base)
+		return;
 
-	mutex_lock(&lock);
 	memset(opp_table_export, 0, sizeof(opp_table_export));
 	memset(raw_dump, 0, sizeof(raw_dump));
 
 	for (c = 0; c < NUM_CLUSTERS; c++) {
 		unsigned int prev_freq = 0;
 		unsigned int dom_base = domain_offsets[c];
-		int entry_count = 0;
 
 		/* Raw dump header */
 		raw_pos += snprintf(raw_dump + raw_pos,
@@ -199,22 +204,19 @@ static int set_apply(const char *val, const struct kernel_param *kp)
 			unsigned int freq_mhz = lut_val & LUT_FREQ_MASK;
 			unsigned int volt_uv  = LUT_VOLT_DECODE(lut_val);
 
-			/* End: freq==0 or repeated freq */
 			if (freq_mhz == 0 || freq_mhz == prev_freq)
 				break;
 
-			/* Raw dump (first 8 per domain) */
 			if (i < 8 && raw_pos < RAW_BUF_SIZE - 32)
 				raw_pos += snprintf(raw_dump + raw_pos,
 						    RAW_BUF_SIZE - raw_pos,
 						    "%08x/%08x ",
 						    lut_val, em_val);
 
-			/* OPP export: freq KHz and voltage µV */
 			snprintf(buf, sizeof(buf), "CPU:%d:%u:%u|",
 				 cluster_policies[c],
-				 freq_mhz * 1000,   /* KHz */
-				 volt_uv);           /* Decoded voltage µV */
+				 freq_mhz * 1000,
+				 volt_uv);
 
 			if (opp_pos + (int)strlen(buf) < OPP_BUF_SIZE - 1) {
 				memcpy(opp_table_export + opp_pos, buf,
@@ -223,22 +225,84 @@ static int set_apply(const char *val, const struct kernel_param *kp)
 			}
 
 			prev_freq = freq_mhz;
-			entry_count++;
 		}
 
 		if (raw_pos < RAW_BUF_SIZE - 2)
 			raw_pos += snprintf(raw_dump + raw_pos,
 					    RAW_BUF_SIZE - raw_pos, "| ");
+	}
 
+	opp_table_export[opp_pos] = '\0';
+	if (opp_pos > 0 && opp_table_export[opp_pos - 1] == '|')
+		opp_table_export[opp_pos - 1] = '\0';
+}
+
+static int get_opp_table(char *buf, const struct kernel_param *kp)
+{
+	int len;
+
+	mutex_lock(&lock);
+	__scan_csram_lut_locked();
+	len = scnprintf(buf, PAGE_SIZE, "%s", opp_table_export);
+	mutex_unlock(&lock);
+	return len;
+}
+
+static const struct kernel_param_ops opp_table_ops = { .get = get_opp_table };
+static int opp_table_dummy;
+module_param_cb(opp_table, &opp_table_ops, &opp_table_dummy, 0444);
+MODULE_PARM_DESC(opp_table, "CPU OPP table (CPU:policy:freq_khz:volt_uv|...) — live CSRAM read");
+
+static int get_raw_dump(char *buf, const struct kernel_param *kp)
+{
+	int len;
+
+	mutex_lock(&lock);
+	__scan_csram_lut_locked();
+	len = scnprintf(buf, PAGE_SIZE, "%s", raw_dump);
+	mutex_unlock(&lock);
+	return len;
+}
+
+static const struct kernel_param_ops raw_dump_ops = { .get = get_raw_dump };
+static int raw_dump_dummy;
+module_param_cb(raw, &raw_dump_ops, &raw_dump_dummy, 0444);
+MODULE_PARM_DESC(raw, "Raw hex dump of LUT entries — live CSRAM read");
+
+/* ─── Scan CSRAM and Export CPU Freq Table ──────────────────────────────── */
+
+static int set_apply(const char *val, const struct kernel_param *kp)
+{
+	int c;
+
+	if (!csram_base) {
+		pr_err("KPM_OC: CSRAM not mapped\n");
+		return -ENOMEM;
+	}
+
+	mutex_lock(&lock);
+	__scan_csram_lut_locked();
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int dom_base = domain_offsets[c];
+		int entry_count = 0, i;
+		unsigned int prev_freq = 0;
+
+		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			u32 lut_val = readl_relaxed(csram_base + dom_base +
+						    REG_FREQ_LUT +
+						    i * LUT_ROW_SIZE);
+			unsigned int freq_mhz = lut_val & LUT_FREQ_MASK;
+
+			if (freq_mhz == 0 || freq_mhz == prev_freq)
+				break;
+			prev_freq = freq_mhz;
+			entry_count++;
+		}
 		pr_info("KPM_OC: Cluster %s (policy%d): %d LUT entries at CSRAM+0x%x\n",
 			cluster_names[c], cluster_policies[c],
 			entry_count, dom_base);
 	}
-
-	opp_table_export[opp_pos] = '\0';
-	/* Remove trailing pipe */
-	if (opp_pos > 0 && opp_table_export[opp_pos - 1] == '|')
-		opp_table_export[opp_pos - 1] = '\0';
 
 	mutex_unlock(&lock);
 	return 0;
@@ -1173,17 +1237,14 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 			if (policy) {
 				struct cpufreq_frequency_table *tbl = policy->freq_table;
 				if (tbl) {
-					int t, max_idx = 0;
-					unsigned int tbl_max = 0;
-
-					for (t = 0; tbl[t].frequency != CPUFREQ_TABLE_END; t++) {
-						if (tbl[t].frequency != CPUFREQ_ENTRY_INVALID &&
-						    tbl[t].frequency > tbl_max) {
-							tbl_max = tbl[t].frequency;
-							max_idx = t;
-						}
-					}
-					tbl[max_idx].frequency = target_khz;
+					/*
+					 * Always update index 0 — it corresponds to
+					 * LUT[0] (the highest OPP in descending LUT).
+					 * Previous code searched for max freq entry,
+					 * which broke on re-OC after underclocking
+					 * (max shifted to a different index).
+					 */
+					tbl[0].frequency = target_khz;
 				}
 				policy->max                 = target_khz;
 				policy->cpuinfo.max_freq    = target_khz;
@@ -1959,17 +2020,134 @@ static int          cpu_volt_ov_count;
 static unsigned int cpu_orig_volt[NUM_CLUSTERS][LUT_MAX_ENTRIES];
 
 /* Configurable via module params */
-static unsigned int gpu_target_freq = 1450000;
+static unsigned int gpu_target_freq = 1500000;
 module_param(gpu_target_freq, uint, 0644);
-MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq for OPP[0] in KHz (default 1450000)");
+MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq in KHz (default 1500000; GPUEB stock max ~1400000)");
 
-static unsigned int gpu_target_volt = 87500;
+static unsigned int gpu_target_volt = 105000;
 module_param(gpu_target_volt, uint, 0644);
-MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt for OPP[0] in µV (default 87500)");
+MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt in 10µV steps (default 105000 = 1050mV)");
 
-static unsigned int gpu_target_vsram = 87500;
+static unsigned int gpu_target_vsram = 95000;
 module_param(gpu_target_vsram, uint, 0644);
-MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram for OPP[0] in µV (default 87500)");
+MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram in 10µV steps (default 95000 = 950mV)");
+
+/*
+ * GPUEB stock max OPP freq (KHz).  Requests at or below this are satisfied
+ * by GPUEB's own OPP table; above this, AP-side PLL programming in
+ * __gpufreq_freq_scale_gpu handles the OC (LEGACY DVFSMode: no GPUEB IPI).
+ */
+#define GPU_STOCK_MAX_KHZ 1400000U
+
+/*
+ * Hardware PLL maximum freq (KHz).  The MFG PLL abort check in
+ * __gpufreq_freq_scale_gpu rejects anything above this (postdiv_pow=1 range).
+ * Writing tgt_freq > this value to the working table causes __gpufreq_abort.
+ */
+#define GPU_PLL_MAX_KHZ   1900000U
+
+/* ─── MFG PLL direct programming (bypass GPUEB for above-stock OC) ──────
+ *
+ * On MT6897 with GPUEBSupport=On, gpufreq_commit() sends IPI to GPUEB which
+ * programs PLL registers.  AP-side __gpufreq_generic_commit_gpu is NEVER called.
+ *
+ * For >1400 MHz OC, we let GPUEB commit OPP[0] normally (1400 MHz + overvolted),
+ * then immediately reprogram MFG PLL and MFGSC PLL to the actual target freq.
+ * GPUEB owns voltage (safe at 105V for ~1500MHz), we only override the clock.
+ *
+ * Register layout (from __gpufreq_freq_scale_gpu disassembly):
+ *   CON1 (offset 0x0C): [31]=PCW_CHG, [26:24]=POSTDIV_POW, [21:0]=PCW
+ *   PCW formula:  PCW = (target_khz * (1 << postdiv_pow) << 14) / 26000
+ *   POSTDIV_POW thresholds:
+ *     > 950000 KHz → 1  (VCO = freq*2, range 1900002–3800000)
+ *     > 475000 KHz → 2  (VCO = freq*4)
+ *     > 237500 KHz → 3  (VCO = freq*8)
+ *     else         → 4  (VCO = freq*16)
+ */
+#define MFG_PLL_PHYS_BASE   0x13FA0000UL
+#define MFG_PLL_PHYS_SIZE   0x400UL
+#define MFGSC_PLL_PHYS_BASE 0x13FA0C00UL
+#define MFGSC_PLL_PHYS_SIZE 0x400UL
+#define MFG_PLL_CON1_OFF    0x0C
+#define GPU_FIN_KHZ         26000U
+#define GPU_PCW_FRAC_BITS   14
+
+static void __iomem *mfg_pll_virt;
+static void __iomem *mfgsc_pll_virt;
+
+static void gpu_pll_set_freq(unsigned int tar_freq_khz)
+{
+	unsigned int postdiv_pow;
+	u64 vco_khz;
+	u32 pcw, con1;
+
+	if (!mfg_pll_virt)
+		return;
+
+	if (tar_freq_khz > GPU_PLL_MAX_KHZ)
+		tar_freq_khz = GPU_PLL_MAX_KHZ;
+
+	if (tar_freq_khz > 950000)
+		postdiv_pow = 1;
+	else if (tar_freq_khz > 475000)
+		postdiv_pow = 2;
+	else if (tar_freq_khz > 237500)
+		postdiv_pow = 3;
+	else
+		postdiv_pow = 4;
+
+	vco_khz = (u64)tar_freq_khz * (1U << postdiv_pow);
+	pcw = (u32)div_u64(vco_khz << GPU_PCW_FRAC_BITS, GPU_FIN_KHZ);
+	con1 = (1U << 31) | (postdiv_pow << 24) | (pcw & 0x3FFFFF);
+
+	writel(con1, mfg_pll_virt + MFG_PLL_CON1_OFF);
+	if (mfgsc_pll_virt)
+		writel(con1, mfgsc_pll_virt + MFG_PLL_CON1_OFF);
+}
+
+/* kretprobe on gpufreq_commit (wrapper exported symbol).
+ * Entry handler captures oppidx; return handler reprograms PLL when OPP==0
+ * and target freq exceeds stock max.
+ */
+struct gpu_commit_kretp_data {
+	int oppidx;
+};
+
+static int __nocfi gpu_commit_kretp_entry(struct kretprobe_instance *ri,
+					  struct pt_regs *regs)
+{
+	struct gpu_commit_kretp_data *d =
+		(struct gpu_commit_kretp_data *)ri->data;
+	d->oppidx = (int)regs->regs[1];
+	return 0;
+}
+
+static int __nocfi gpu_commit_kretp_ret(struct kretprobe_instance *ri,
+					struct pt_regs *regs)
+{
+	struct gpu_commit_kretp_data *d =
+		(struct gpu_commit_kretp_data *)ri->data;
+	unsigned int tgt = READ_ONCE(gpu_target_freq);
+	int ret_val = (int)regs_return_value(regs);
+
+	/* Only override PLL when:
+	 * 1) commit succeeded (ret == 0)
+	 * 2) OPP was 0 (max freq)
+	 * 3) target freq exceeds stock max
+	 */
+	if (ret_val == 0 && d->oppidx == 0 && tgt > GPU_STOCK_MAX_KHZ)
+		gpu_pll_set_freq(tgt);
+
+	return 0;
+}
+
+static struct kretprobe gpu_commit_kretp = {
+	.handler = gpu_commit_kretp_ret,
+	.entry_handler = gpu_commit_kretp_entry,
+	.data_size = sizeof(struct gpu_commit_kretp_data),
+	.maxactive = 4,
+	.kp.symbol_name = "gpufreq_commit",
+};
 
 static char gpu_oc_result[GPU_RESULT_BUF_SIZE];
 module_param_string(gpu_oc_result, gpu_oc_result, sizeof(gpu_oc_result), 0444);
@@ -1994,6 +2172,11 @@ typedef void (*gpufreq_update_shared_t)(void);
  * is CPU-accessible even when GPU is powered off, unlike the internal variant.
  */
 typedef u32 *(*gpufreq_get_table_tgt_t)(int target);
+/* gpufreq_fix_custom_freq_volt(target, freq_khz, volt_10uv) from mtk_gpufreq_wrapper.
+ * Forces GPU/STACK to a custom freq+volt bypassing OPP-table DVFS.
+ * Returns 0 on success, -EINVAL when GPU is powered off or freq out of range.
+ */
+typedef int (*gpufreq_fix_custom_fv_t)(int target, unsigned int freq, unsigned int volt);
 
 /* Saved only for diagnostics; runtime patching no longer relies on this. */
 static unsigned long opp_table_anchor;
@@ -2002,6 +2185,7 @@ static gpufreq_get_table_t fn_get_signed_table_gpu;
 static gpufreq_get_table_tgt_t fn_get_working_table_wrap;
 static gpufreq_get_table_tgt_t fn_get_signed_table_wrap;
 static gpufreq_update_shared_t fn_update_shared_status_opp_table;
+static gpufreq_fix_custom_fv_t fn_fix_custom_fv;
 
 /*
  * Track availability/patch state. Bits:
@@ -2042,6 +2226,10 @@ static void __nocfi gpu_resolve_runtime_symbols(void)
     if (!fn_get_signed_table_wrap)
         fn_get_signed_table_wrap =
             (gpufreq_get_table_tgt_t)kln_func("gpufreq_get_signed_table");
+    /* Direct GPU freq override — bypasses GPUEB OPP table for above-stock OC */
+    if (!fn_fix_custom_fv)
+        fn_fix_custom_fv =
+            (gpufreq_fix_custom_fv_t)kln_func("gpufreq_fix_custom_freq_volt");
 }
 
 static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
@@ -2049,6 +2237,7 @@ static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
 	u32 freq;
 	u32 volt;
 	u32 vsram;
+	unsigned int clamped_freq;
 
 	if (!tbl)
 		return 0;
@@ -2061,15 +2250,19 @@ static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
 		return 0;
 	}
 
-	if (freq == gpu_target_freq &&
+	clamped_freq = gpu_target_freq;
+	if (clamped_freq > GPU_PLL_MAX_KHZ)
+		clamped_freq = GPU_PLL_MAX_KHZ;
+
+	if (freq == clamped_freq &&
 	    volt == gpu_target_volt &&
 	    vsram == gpu_target_vsram)
 		return bit;
 
 	pr_info("KPM_OC: %s[0] at %px freq=%u->%u volt=%u->%u vsram=%u->%u\n",
-		name, tbl, freq, gpu_target_freq, volt, gpu_target_volt,
+		name, tbl, freq, clamped_freq, volt, gpu_target_volt,
 		vsram, gpu_target_vsram);
-	tbl[0] = gpu_target_freq;
+	tbl[0] = clamped_freq;
 	tbl[1] = gpu_target_volt;
 	tbl[2] = gpu_target_vsram;
 	return bit;
@@ -2217,6 +2410,10 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 	if (tgt_freq == 0)
 		return 0;
 
+	/* Clamp to PLL hardware max to prevent __gpufreq_abort on commit */
+	if (tgt_freq > GPU_PLL_MAX_KHZ)
+		tgt_freq = GPU_PLL_MAX_KHZ;
+
 	/* Unconditionally re-patch default_opp_table[0].
 	 * GPUEB firmware continuously overwrites freq+volt+vsram in shared
 	 * memory, so we must force ALL three fields every commit — not just
@@ -2271,21 +2468,12 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 		}
 	}
 
-	/* Rate-limited diagnostic: log pre-patch state + arg (oppidx) */
-	if (time_after(jiffies, last_log_jiffies + msecs_to_jiffies(2000))) {
-		u32 wt_freq = 0;
-		u32 def_freq = 0;
-		if (opp_table_anchor)
-			def_freq = READ_ONCE(((u32 *)opp_table_anchor)[0]);
-		tbl = NULL;
-		if (fn_get_working_table_gpu)
-			tbl = fn_get_working_table_gpu();
-		if (!tbl && fn_get_working_table_wrap)
-			tbl = fn_get_working_table_wrap(0);
-		if (tbl)
-			wt_freq = READ_ONCE(tbl[0]);
-		pr_info("KPM_OC: gpu_commit_kp: oppidx=%u def[0]=%u wt[0]=%u tgt=%u\n",
-			(unsigned int)regs->regs[0], def_freq, wt_freq, tgt_freq);
+	/* Rate-limited diagnostic: log oppidx + target (avoids redundant
+	 * function calls on the hot path; tables were just patched above).
+	 */
+	if (time_after(jiffies, last_log_jiffies + msecs_to_jiffies(5000))) {
+		pr_info("KPM_OC: gpu_commit_kp: oppidx=%u tgt_freq=%u tgt_volt=%u\n",
+			(unsigned int)regs->regs[0], tgt_freq, tgt_volt);
 		last_log_jiffies = jiffies;
 	}
 
@@ -2303,7 +2491,7 @@ static struct kprobe gpu_commit_kp = {
  * acts primarily as a safety net for power-on/off transitions where GPUEB
  * refreshes tables outside the commit path.
  */
-static int gpu_oc_kthread_fn(void *data)
+static int __nocfi gpu_oc_kthread_fn(void *data)
 {
 	int miss_cnt = 0;
 	int last_state = 0;
@@ -2321,11 +2509,38 @@ static int gpu_oc_kthread_fn(void *data)
 
 		mutex_lock(&lock);
 		gpu_oc_patched |= gpu_oc_patch_wk_ss();
+		gpu_resolve_runtime_symbols();
 		/* Check working_table bit only; signed_table may be NULL on
 		 * this SoC and that is expected — not a miss condition.
 		 */
 		now = gpu_oc_patched & 2;
 		mutex_unlock(&lock);
+
+		/*
+		 * GPUEB voltage+frequency management:
+		 *
+		 * With GPUEBSupport=On, gpufreq_commit() sends IPI to GPUEB
+		 * which programs PLL+voltage directly.  AP-side
+		 * __gpufreq_generic_commit_gpu is NEVER called.
+		 *
+		 * For above-stock OC:
+		 *   DO NOT call fix_custom_freq_volt — it locks GPUEB at a
+		 *   fixed OPP, blocking thermal throttling.  Instead, let
+		 *   GPUEB manage DVFS normally.  The gpu_commit_kretp
+		 *   kretprobe reprograms PLL after each OPP[0] commit,
+		 *   giving us above-stock freq while preserving GPUEB's
+		 *   ability to throttle to lower OPPs under thermal pressure.
+		 *
+		 * For at-or-below stock: call fix_custom_freq_volt normally
+		 *   to enforce custom freq+volt via GPUEB IPI.
+		 */
+		{
+			unsigned int tgt = READ_ONCE(gpu_target_freq);
+			unsigned int vlt = READ_ONCE(gpu_target_volt);
+
+			if (tgt <= GPU_STOCK_MAX_KHZ && fn_fix_custom_fv)
+				fn_fix_custom_fv(0, tgt, vlt);
+		}
 
 		if (now == 2 && last_state != 2)
 			pr_info("KPM_OC: GPU relift: working patched (patched=%d)\n",
@@ -2354,6 +2569,7 @@ static int set_gpu_oc(const char *val, const struct kernel_param *kp)
 	unsigned long opp_table_addr;
 	u32 *opp_entry;
 	u32 orig_freq, orig_volt, orig_vsram;
+	unsigned int clamped_freq;
 	int pos = 0;
 	int newly_patched = 0;
 
@@ -2388,12 +2604,15 @@ static int set_gpu_oc(const char *val, const struct kernel_param *kp)
 	}
 
 	opp_entry[0] = gpu_target_freq;
+	if (opp_entry[0] > GPU_PLL_MAX_KHZ)
+		opp_entry[0] = GPU_PLL_MAX_KHZ;
+	clamped_freq = opp_entry[0];
 	opp_entry[1] = gpu_target_volt;
 	opp_entry[2] = gpu_target_vsram;
 	newly_patched |= 1;
 
 	pr_info("KPM_OC: default_opp[0]: freq=%u->%u volt=%u->%u vsram=%u->%u\n",
-		orig_freq, gpu_target_freq,
+		orig_freq, clamped_freq,
 		orig_volt, gpu_target_volt,
 		orig_vsram, gpu_target_vsram);
 
@@ -2407,7 +2626,7 @@ static int set_gpu_oc(const char *val, const struct kernel_param *kp)
 	gpu_oc_patched |= newly_patched;
 	pos = snprintf(gpu_oc_result, GPU_RESULT_BUF_SIZE,
 		       "OK:patched=%d,freq=%u->%u,volt=%u->%u,vsram=%u->%u",
-		       gpu_oc_patched, orig_freq, gpu_target_freq,
+		       gpu_oc_patched, orig_freq, clamped_freq,
 		       orig_volt, gpu_target_volt,
 		       orig_vsram, gpu_target_vsram);
 
@@ -2881,6 +3100,37 @@ static int __init kpm_oc_init(void)
 			pr_info("KPM_OC: __gpufreq_generic_commit_gpu kprobe registered (GPUEB countermeasure)\n");
 	}
 
+	/* MFG PLL direct access for above-stock GPU OC.
+	 * ioremap both MFG PLL and MFGSC PLL registers so gpu_pll_set_freq()
+	 * can reprogram clock after GPUEB commits.
+	 */
+	mfg_pll_virt = ioremap(MFG_PLL_PHYS_BASE, MFG_PLL_PHYS_SIZE);
+	if (mfg_pll_virt)
+		pr_info("KPM_OC: MFG PLL mapped at %px (phys 0x%lx)\n",
+			mfg_pll_virt, MFG_PLL_PHYS_BASE);
+	else
+		pr_warn("KPM_OC: MFG PLL ioremap failed\n");
+
+	mfgsc_pll_virt = ioremap(MFGSC_PLL_PHYS_BASE, MFGSC_PLL_PHYS_SIZE);
+	if (mfgsc_pll_virt)
+		pr_info("KPM_OC: MFGSC PLL mapped at %px (phys 0x%lx)\n",
+			mfgsc_pll_virt, MFGSC_PLL_PHYS_BASE);
+	else
+		pr_warn("KPM_OC: MFGSC PLL ioremap failed\n");
+
+	/* kretprobe on gpufreq_commit (wrapper): reprogram PLL after every
+	 * GPUEB commit to OPP[0] for above-stock GPU OC.
+	 */
+	{
+		int kret_kretp = register_kretprobe(&gpu_commit_kretp);
+
+		if (kret_kretp < 0)
+			pr_warn("KPM_OC: gpufreq_commit kretprobe failed (%d)\n",
+				kret_kretp);
+		else
+			pr_info("KPM_OC: gpufreq_commit kretprobe registered (PLL override)\n");
+	}
+
 	/* FHCTL mcupm_hopping_v1 argument capture kprobe */
 	{
 		int kret6 = register_kprobe(&fhctl_hop_kp);
@@ -2950,6 +3200,7 @@ static void __exit kpm_oc_exit(void)
 	unregister_kprobe(&scmi_fast_switch_kp);
 	unregister_kprobe(&scmi_set_target_kp);
 	unregister_kprobe(&gpu_commit_kp);
+	unregister_kretprobe(&gpu_commit_kretp);
 	unregister_kprobe(&fhctl_hop_kp);
 	unregister_kprobe(&scmi_perf_level_kp);
 	unregister_kprobe(&scmi_dvfs_freq_kp);
@@ -2967,6 +3218,10 @@ static void __exit kpm_oc_exit(void)
 		iounmap(mcupm_sram_base);
 	if (mcupm_dram_base)
 		iounmap(mcupm_dram_base);
+	if (mfg_pll_virt)
+		iounmap(mfg_pll_virt);
+	if (mfgsc_pll_virt)
+		iounmap(mfgsc_pll_virt);
 	pr_info("KPM_OC: Unloaded.\n");
 }
 

@@ -1,8 +1,8 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v7.2) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (v7.6) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
-- **CPU OPP reader** — exports CSRAM LUT data to userspace
+- **CPU OPP reader** — exports CSRAM LUT data to userspace via live sysfs reads (re-reads CSRAM on every access)
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
 - **CPU per-LUT voltage override** — direct CSRAM write for any LUT entry, bypassing stock constraints
 - **MCUPM CSRAM countermeasure** *(v7.2)* — kprobes on CPU DVFS transition functions resync OC voltages into CSRAM immediately before every frequency transition, preventing MCUPM firmware from silently reverting them
@@ -109,9 +109,9 @@ All parameters are under `/sys/module/kpm_oc/parameters/`.
 
 | Parameter | Access | Description |
 |-----------|--------|-------------|
-| `opp_table` | R | Pipe-delimited: `CPU:policy:freq_khz:volt_uv\|...` |
-| `raw` | R | Raw hex dump of LUT + EM entries per domain (debug) |
-| `apply` | W | Write `1` to rescan CSRAM |
+| `opp_table` | R | Pipe-delimited: `CPU:policy:freq_khz:volt_uv\|...` — live CSRAM read on every access |
+| `raw` | R | Raw hex dump of LUT + EM entries per domain (debug) — live CSRAM read on every access |
+| `apply` | W | Write `1` to trigger a rescan (legacy; reads are now live) |
 
 ### CPU OC — Write target, then apply
 
@@ -299,10 +299,11 @@ cat /proc/gpufreqv2/gpu_working_opp_table | head -5
 - **GPU GPUEB mode**: `__gpufreq_get_working_table_gpu()` returns NULL when GPU is powered off; the module falls back to `gpufreq_get_working_table(0)` (wrapper public API) which reads `g_shared_status` — always CPU-accessible
 - **GPU relift**: the GPU kthread runs for the module lifetime and re-applies all GPU table patches (OPP[0] OC + per-OPP voltage overrides) every 500 ms, keeping OC active through GPU power-cycles and vendor runtime refreshes
 - **kthread safety**: the GPU relift kthread exits only via `kthread_stop()` to prevent UAF on `rmmod`
-- **CPU OC mechanism**: Writes new LUT entry (freq + volt, preserving gear-selector bits) to CSRAM, then updates `cpufreq_policy` freq_table max entry, `policy->max`, and `cpuinfo.max_freq` so the governor can target the new ceiling
+- **CPU OC mechanism**: Writes new LUT entry (freq + volt, preserving gear-selector bits) to CSRAM, then updates `cpufreq_policy` freq_table[0] (always index 0, the highest OPP in descending LUT), `policy->max`, and `cpuinfo.max_freq` so the governor can target the new ceiling. The freq_table[0] direct update ensures correct re-OC after underclock (previously, a max-search loop selected the wrong index when index 0 held the underclocked value)
 - **CPU voltage override**: Writes directly to CSRAM LUT entries via `writel_relaxed`, preserving gear-selector and frequency bits. Original values are saved on first override and restored on `clear`
 - **GPU voltage override**: Patches both `g_gpu_default_opp_table` and working table entries in kernel memory, bypassing the vendor `fix_custom_freq_volt` function which rejects writes when DVFSState validation fails (GPU powered off, volt clamp). Original values are saved on first override and restored on `clear`
 - **Boot-time OC**: When loaded with nonzero `cpu_oc_*_freq` params (e.g. from APatch service.sh), CPU OC is auto-applied during `kpm_oc_init`
+- **Live sysfs reads** *(v7.6)*: `opp_table` and `raw` parameters use `module_param_cb` with `.get` callbacks that call `__scan_csram_lut_locked()` on every sysfs read, returning current CSRAM data without requiring an explicit `apply` write. The shared scan helper is also used by `set_apply()` to avoid duplicated logic
 - **GPU max reporting caveat**: some generic kernel-manager apps still show the stock 1400 MHz ceiling because they read devfreq `max_freq`; verify effective GPU OC via `/proc/gpufreqv2/gpu_working_opp_table` and `gpu_oc_result`
 
 ## License
