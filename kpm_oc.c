@@ -161,11 +161,27 @@ static char raw_dump[RAW_BUF_SIZE];
 static DEFINE_MUTEX(lock);
 static void __iomem *csram_base;
 
+/* ─── Cached OPP table (survives MCUPM CSRAM rewrites) ─────────────────── */
+/*
+ * MCUPM firmware rewrites CSRAM LUT after boot, reducing entries to 1 per
+ * cluster.  We cache the full table at module init (when CSRAM is fresh)
+ * and serve the cached data from get_opp_table().  OC and voltage override
+ * operations update the cache directly.
+ */
+struct opp_entry {
+	unsigned int freq_khz;
+	unsigned int volt_uv;
+};
+static struct opp_entry opp_cache[NUM_CLUSTERS][LUT_MAX_ENTRIES];
+static int opp_cache_count[NUM_CLUSTERS];
+static bool opp_cache_valid;
+
 /* ─── Dynamic sysfs readers for opp_table and raw ──────────────────────── */
 
 /*
  * Shared helper: scan CSRAM LUT and populate opp_table_export[] + raw_dump[].
- * Called from both set_apply() and the dynamic .get callbacks.
+ * Also populates opp_cache[] if not already valid.
+ * Called from set_apply() and get_raw_dump().
  * Caller must hold lock.
  */
 static void __scan_csram_lut_locked(void)
@@ -174,6 +190,7 @@ static void __scan_csram_lut_locked(void)
 	char buf[96];
 	int opp_pos = 0;
 	int raw_pos = 0;
+	int total_entries = 0;
 
 	if (!csram_base)
 		return;
@@ -184,6 +201,7 @@ static void __scan_csram_lut_locked(void)
 	for (c = 0; c < NUM_CLUSTERS; c++) {
 		unsigned int prev_freq = 0;
 		unsigned int dom_base = domain_offsets[c];
+		int cluster_count = 0;
 
 		/* Raw dump header */
 		raw_pos += snprintf(raw_dump + raw_pos,
@@ -224,8 +242,11 @@ static void __scan_csram_lut_locked(void)
 				opp_pos += strlen(buf);
 			}
 
+			cluster_count++;
 			prev_freq = freq_mhz;
 		}
+
+		total_entries += cluster_count;
 
 		if (raw_pos < RAW_BUF_SIZE - 2)
 			raw_pos += snprintf(raw_dump + raw_pos,
@@ -235,6 +256,65 @@ static void __scan_csram_lut_locked(void)
 	opp_table_export[opp_pos] = '\0';
 	if (opp_pos > 0 && opp_table_export[opp_pos - 1] == '|')
 		opp_table_export[opp_pos - 1] = '\0';
+
+	/* Populate cache only if CSRAM has meaningful data (>1 per cluster avg).
+	 * MCUPM firmware rewrites CSRAM after boot, leaving ~1 entry per cluster.
+	 * We only cache the full initial scan; subsequent sparse scans are ignored.
+	 */
+	if (!opp_cache_valid && total_entries > NUM_CLUSTERS) {
+		for (c = 0; c < NUM_CLUSTERS; c++) {
+			unsigned int prev_f = 0;
+			unsigned int dom_base = domain_offsets[c];
+			int cnt = 0;
+
+			for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+				u32 lut_val = readl_relaxed(csram_base +
+					dom_base + REG_FREQ_LUT +
+					i * LUT_ROW_SIZE);
+				unsigned int f = lut_val & LUT_FREQ_MASK;
+				unsigned int v = LUT_VOLT_DECODE(lut_val);
+
+				if (f == 0 || f == prev_f)
+					break;
+				opp_cache[c][i].freq_khz = f * 1000;
+				opp_cache[c][i].volt_uv  = v;
+				cnt++;
+				prev_f = f;
+			}
+			opp_cache_count[c] = cnt;
+		}
+		opp_cache_valid = true;
+		pr_info("KPM_OC: OPP cache populated (%d/%d/%d entries)\n",
+			opp_cache_count[0], opp_cache_count[1],
+			opp_cache_count[2]);
+	}
+}
+
+/*
+ * Generate OPP table string from cache.
+ * Caller must hold lock.
+ */
+static int __format_opp_cache_locked(char *buf, int buf_size)
+{
+	int c, i, pos = 0;
+	char tmp[96];
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		for (i = 0; i < opp_cache_count[c]; i++) {
+			int len = snprintf(tmp, sizeof(tmp), "CPU:%d:%u:%u|",
+					   cluster_policies[c],
+					   opp_cache[c][i].freq_khz,
+					   opp_cache[c][i].volt_uv);
+			if (pos + len < buf_size - 1) {
+				memcpy(buf + pos, tmp, len);
+				pos += len;
+			}
+		}
+	}
+	buf[pos] = '\0';
+	if (pos > 0 && buf[pos - 1] == '|')
+		buf[--pos] = '\0';
+	return pos;
 }
 
 static int get_opp_table(char *buf, const struct kernel_param *kp)
@@ -242,8 +322,18 @@ static int get_opp_table(char *buf, const struct kernel_param *kp)
 	int len;
 
 	mutex_lock(&lock);
-	__scan_csram_lut_locked();
-	len = scnprintf(buf, PAGE_SIZE, "%s", opp_table_export);
+
+	/* If cache is valid, serve cached data (stable across MCUPM rewrites).
+	 * Otherwise fall back to live CSRAM scan. */
+	if (opp_cache_valid) {
+		len = __format_opp_cache_locked(opp_table_export,
+						sizeof(opp_table_export));
+		len = scnprintf(buf, PAGE_SIZE, "%s", opp_table_export);
+	} else {
+		__scan_csram_lut_locked();
+		len = scnprintf(buf, PAGE_SIZE, "%s", opp_table_export);
+	}
+
 	mutex_unlock(&lock);
 	return len;
 }
@@ -1353,6 +1443,12 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 				"%s:%u->%uKHz@%uuV,",
 				cluster_names[c], orig_freq_mhz * 1000, target_khz, target_uv);
 		any_patched++;
+
+		/* Update OPP cache entry for LUT[0] (highest freq) */
+		if (opp_cache_valid && c < NUM_CLUSTERS && opp_cache_count[c] > 0) {
+			opp_cache[c][0].freq_khz = target_khz;
+			opp_cache[c][0].volt_uv  = target_uv;
+		}
 
 		/* ── Update cpufreq policy so governor can target new max freq ── */
 		{
@@ -3224,6 +3320,11 @@ static int set_cpu_volt_ov(const char *val, const struct kernel_param *kp)
 
 		pr_info("KPM_OC: cpu_volt_ov c%u[%u]: %uµV->%uµV (0x%08x->0x%08x)\n",
 			cl, idx, orig_volt_uv, volt_uv, orig_lut, new_lut);
+
+		/* Update OPP cache so get_opp_table reflects the change */
+		if (opp_cache_valid && cl < NUM_CLUSTERS &&
+		    (int)idx < opp_cache_count[cl])
+			opp_cache[cl][idx].volt_uv = volt_uv;
 
 		count++;
 		pos += snprintf(cpu_volt_ov_result + pos,
