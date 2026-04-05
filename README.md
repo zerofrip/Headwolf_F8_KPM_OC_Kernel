@@ -13,7 +13,7 @@ Kernel module (v8.0) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 - **FHCTL / MCU PLL hopping** *(v8.0)* — IPI-based PLL frequency control via MCUPM fhctl interface; captures `mcupm_hopping_v1` calls for diagnostics
 - **SCMI DVFS capture & override** *(v8.0)* — kprobes on `scmi_perf_level_set` / `scmi_dvfs_freq_set` for diagnostics and optional performance level override
 
-Used by the [APatch module (v8.0)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, persistent configuration, and a boot-time service with gaming monitor daemon.
+Used by the [APatch module (v9.0)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, per-section split config persistence (`conf/*.json`), legacy config auto-migration, and a boot-time service with gaming monitor daemon.
 
 ## Hardware Details
 
