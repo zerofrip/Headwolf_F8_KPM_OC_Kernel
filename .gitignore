@@ -14,3 +14,4 @@ Module.symvers
 *~
 .vscode/
 kpm_oc.ko
+modules.order
