@@ -4,15 +4,10 @@
 *.mod.c
 *.order
 *.symvers
+*.ko
 .*.cmd
 .tmp_versions/
-modules.order
-Module.symvers
-
 # Editor
 *.swp
 *~
 .vscode/
-kpm_oc.ko
-modules.order
-kpm_oc.mod
