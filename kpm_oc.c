@@ -45,6 +45,7 @@
 #include <linux/string.h>
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
+#include <linux/input.h>
 
 /* ─── CSRAM Configuration ───────────────────────────────────────────────── */
 /*
@@ -3362,6 +3363,100 @@ module_param_cb(cpu_volt_override, &cpu_volt_ov_ops, &cpu_volt_ov_dummy, 0220);
 MODULE_PARM_DESC(cpu_volt_override,
 		 "Per-LUT CPU voltage override: 'cl:idx:volt_uv ...' (CSRAM direct)");
 
+/* ─── Proximity Screen Control ──────────────────────────────────────────── */
+/*
+ * Hook hf_manager_report_event() to detect proximity sensor events.
+ * When the sensor reports "near" (value == 0), inject KEY_SLEEP to turn
+ * the screen off.  When it reports "far" (value != 0), inject KEY_WAKEUP.
+ *
+ * hf_manager_event structure (76 bytes, from hf_manager.ko disassembly):
+ *   +0x00  int64_t  timestamp
+ *   +0x08  uint8_t  sensor_type  (8 = proximity)
+ *   +0x09  uint8_t  action
+ *   +0x0a  uint8_t  accuracy
+ *   +0x0b  uint8_t  reserved
+ *   +0x0c  int32_t  word[16]     (proximity: 0x00000000 = near/0.0f,
+ *                                             0x40A00000 = far/5.0f)
+ */
+
+#define PROX_SENSOR_TYPE        8       /* MTK sensor type: proximity         */
+#define PROX_DEBOUNCE_MS        300     /* ignore rapid near↔far transitions  */
+
+static bool prox_screen_enabled;
+module_param(prox_screen_enabled, bool, 0644);
+MODULE_PARM_DESC(prox_screen_enabled,
+		 "Enable proximity-based screen on/off (near→sleep, far→wake)");
+
+static int prox_screen_state = -1;     /* -1=unknown, 0=near, 5=far */
+module_param(prox_screen_state, int, 0444);
+MODULE_PARM_DESC(prox_screen_state,
+		 "Last proximity state (ro): -1=unknown, 0=near, 5=far");
+
+static struct input_dev *prox_input_dev;
+static struct work_struct prox_screen_work;
+static unsigned long prox_last_change_jiffies;
+
+static void prox_screen_work_fn(struct work_struct *work)
+{
+	int state = READ_ONCE(prox_screen_state);
+
+	if (!prox_input_dev)
+		return;
+
+	if (state == 0) {
+		input_report_key(prox_input_dev, KEY_SLEEP, 1);
+		input_sync(prox_input_dev);
+		input_report_key(prox_input_dev, KEY_SLEEP, 0);
+		input_sync(prox_input_dev);
+		pr_info("KPM_OC: proximity NEAR → screen off\n");
+	} else if (state == 5) {
+		input_report_key(prox_input_dev, KEY_WAKEUP, 1);
+		input_sync(prox_input_dev);
+		input_report_key(prox_input_dev, KEY_WAKEUP, 0);
+		input_sync(prox_input_dev);
+		pr_info("KPM_OC: proximity FAR → screen on\n");
+	}
+}
+
+static int __nocfi prox_report_kp_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	u64 ev;
+	u8 stype;
+	u32 raw;
+	int new_state;
+
+	if (!READ_ONCE(prox_screen_enabled))
+		return 0;
+
+	ev = regs->regs[1];   /* x1 = event struct pointer */
+
+	stype = *(volatile u8 *)(ev + 0x08);
+	if (stype != PROX_SENSOR_TYPE)
+		return 0;
+
+	raw = *(volatile u32 *)(ev + 0x0c);
+	new_state = (raw == 0) ? 0 : 5;
+
+	if (new_state == READ_ONCE(prox_screen_state))
+		return 0;
+
+	if (time_before(jiffies,
+			prox_last_change_jiffies +
+			msecs_to_jiffies(PROX_DEBOUNCE_MS)))
+		return 0;
+
+	WRITE_ONCE(prox_screen_state, new_state);
+	prox_last_change_jiffies = jiffies;
+	schedule_work(&prox_screen_work);
+
+	return 0;
+}
+
+static struct kprobe prox_report_kp = {
+	.symbol_name = "hf_manager_report_event",
+	.pre_handler = prox_report_kp_pre,
+};
+
 /* ─── Module Init / Exit ────────────────────────────────────────────────── */
 
 static int __init kpm_oc_init(void)
@@ -3555,11 +3650,40 @@ static int __init kpm_oc_init(void)
 		}
 	}
 
+	/* ─── Proximity screen control: virtual input device + kprobe ──── */
+	INIT_WORK(&prox_screen_work, prox_screen_work_fn);
+	prox_input_dev = input_allocate_device();
+	if (prox_input_dev) {
+		prox_input_dev->name = "kpm_oc_proximity";
+		prox_input_dev->id.bustype = BUS_VIRTUAL;
+		set_bit(EV_KEY, prox_input_dev->evbit);
+		set_bit(KEY_SLEEP, prox_input_dev->keybit);
+		set_bit(KEY_WAKEUP, prox_input_dev->keybit);
+		if (input_register_device(prox_input_dev)) {
+			input_free_device(prox_input_dev);
+			prox_input_dev = NULL;
+			pr_warn("KPM_OC: proximity input device registration failed\n");
+		}
+	}
+	{
+		int kret_prox = register_kprobe(&prox_report_kp);
+
+		if (kret_prox < 0)
+			pr_warn("KPM_OC: hf_manager_report_event kprobe failed (%d)\n",
+				kret_prox);
+		else
+			pr_info("KPM_OC: proximity screen control kprobe registered\n");
+	}
+
 	return 0;
 }
 
 static void __exit kpm_oc_exit(void)
 {
+	unregister_kprobe(&prox_report_kp);
+	cancel_work_sync(&prox_screen_work);
+	if (prox_input_dev)
+		input_unregister_device(prox_input_dev);
 	unregister_kprobe(&freq_qos_kp);
 	unregister_kprobe(&userlimit_kp);
 	unregister_kprobe(&scmi_fast_switch_kp);
