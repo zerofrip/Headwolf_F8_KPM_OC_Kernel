@@ -1,6 +1,6 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v8.0) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (v8.1) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 - **CPU OPP reader** — exports CSRAM LUT data to userspace via live sysfs reads (re-reads CSRAM on every access)
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
@@ -13,7 +13,7 @@ Kernel module (v8.0) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 - **FHCTL / MCU PLL hopping** *(v8.0)* — IPI-based PLL frequency control via MCUPM fhctl interface; captures `mcupm_hopping_v1` calls for diagnostics
 - **SCMI DVFS capture & override** *(v8.0)* — kprobes on `scmi_perf_level_set` / `scmi_dvfs_freq_set` for diagnostics and optional performance level override
 
-Used by the [APatch module (v10.1)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, per-section split config persistence (`conf/*.json`) with per-section Apply buttons, legacy config auto-migration, and a boot-time service with gaming monitor daemon.
+Used by the [APatch module (v10.7)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, per-section split config persistence (`conf/*.json`) with per-section Apply buttons, legacy config auto-migration, and a boot-time service with gaming monitor daemon.
 
 ## Hardware Details
 
@@ -88,13 +88,15 @@ All kprobes are registered at module init:
 |---------------|------|--------|---------|
 | `freq_qos_update_request` | kprobe | core kernel | Intercept vendor freq_qos MAX lowering calls; silently raise argument to OC target so vendor constraints cannot clamp the OC ceiling |
 | `update_userlimit_cpufreq_max` | kprobe | platform driver | Intercept powerhal / touch_boost calls that restore the stock CPU max; raise the argument to the OC target |
-| `scmi_cpufreq_fast_switch` | kprobe | `scmi_cpufreq` | Re-patch CSRAM LUT voltages before fast-switch path |
-| `scmi_cpufreq_set_target` | kprobe | `scmi_cpufreq` | Re-patch CSRAM LUT voltages before target-index path |
+| `scmi_cpufreq_fast_switch` | kprobe | `scmi_cpufreq` | Re-patch CSRAM LUT voltages before fast-switch path (schedutil hot path) |
+| `scmi_cpufreq_set_target` | kprobe | `scmi_cpufreq` | Re-patch CSRAM LUT voltages before target-index path (interactive governors) |
 | `__gpufreq_generic_commit_gpu` | kprobe | `mtk_gpufreq_mt6897` | Re-patch GPU default + working OPP[0] before commit reads them |
 | `gpufreq_commit` | kretprobe | `mtk_gpufreq_mt6897` | Reprogram MFG PLL CON1 after GPUEB commits above-stock OC freq |
 | `mcupm_hopping_v1` | kprobe | `mtk_fhctl` | Capture MCU PLL DDS changes via IPI for diagnostics |
 | `scmi_perf_level_set` | kprobe | `scmi_perf` | Capture / override SCMI DVFS performance levels |
 | `scmi_dvfs_freq_set` | kprobe | `scmi_dvfs` | Capture SCMI DVFS frequency set requests |
+
+> **Note:** This SoC uses the `mtk-cpufreq-hw` driver (performance-controller LUT), not the SCMI cpufreq driver. The `scmi_cpufreq_*` symbols referenced by these kprobes belong to the cpufreq shim layer used by MCUPM IPI; they fire on every cpufreq transition regardless of governor.
 
 The pre-handler for each CPU DVFS kprobe calls `cpu_csram_resync_fast()`, which writes OC voltages to CSRAM for all clusters nanoseconds before the HW reads `REG_FREQ_PERF_STATE`. The GPU kprobe pre-handler re-patches `default_table[0]` and `working_table[0]` before `__gpufreq_generic_commit_gpu` dereferences them.
 
@@ -250,6 +252,23 @@ cat /proc/gpufreqv2/gpu_working_opp_table | head -5
 | `pll_scan` | W | Dump MCU PLL CON0-3, FHCTL registers |
 | `perf_scan` | W | Dump CSRAM `perf_state` + `hw_state` per domain |
 | `kvm_read_trigger` | W | Read 256 bytes at a kernel virtual address (debug) |
+
+## Not Implemented / Known Limitations
+
+### DT2W (Double Tap to Wake)
+
+Double-tap-to-wake gesture support was investigated and a working prototype was confirmed in v7.1 (kprobe on `nvt_bootloader_reset` pre-handler), but it was removed for the following reasons:
+
+- **Touch driver in vendor module** — The NT36523 touch controller driver (`nvt_ts`) is compiled into a vendor kernel module. Its internal symbols (`nvt_bootloader_reset`, `nvt_ts_resume`, etc.) are not exported in the GKI symbol table. Kprobe registration requires `kallsyms_lookup_name` at runtime and succeeds only if the vendor module happens to be loaded first; there is no stable ABI guarantee.
+- **`nvt_ts_pm_resume()` does not fire** — This device routes display power management through a DRM notifier only. The standard `pm_suspend` / `pm_resume` callbacks in the NT36523 driver are never invoked, so the documented gesture-mode API (writing to gesture registers in the resume path) cannot be used directly.
+- **Fragile internal call sequence** — The workaround was a pre-handler kprobe on `nvt_bootloader_reset` that re-armed the gesture EINT before the firmware reset cleared it. The correct timing relies on `nvt_ts_resume()` → `nvt_bootloader_reset()` → gesture EINT re-arm, which is an undocumented internal order that can change silently across vendor OTA updates without any API-level indication.
+- **GKI CFI / KCFI constraints** — GKI 6.1 is built with `CONFIG_CFI_CLANG=y`. Kprobing non-exported vendor module functions whose KCFI type hashes differ from the expected call-site hash can trigger a KCFI failure, causing an immediate kernel panic and boot loop. Handlers must be marked `__nocfi` and even then the indirect call through a kallsyms-resolved pointer can mismatch.
+
+### Proximity Sensor
+
+The Headwolf F8 does not have a proximity sensor. There is no proximity sensor IC wired to the SoC on this hardware revision and no corresponding devicetree node is defined. Any code path that reads a proximity sensor event source returns no data.
+
+---
 
 ## Build
 
