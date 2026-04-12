@@ -46,6 +46,21 @@
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
 #include <linux/input.h>
+#include <linux/suspend.h>
+
+/* ─── Suspend/Resume Protection ─────────────────────────────────────────
+ *
+ * During suspend the GPU (MFG domain), CSRAM power gating, and cpufreq
+ * subsystem are all in undefined states.  Any readl/writel to powered-off
+ * MMIO, any call through resolved kernel function pointers, or even a
+ * mutex_lock that contends with a frozen thread can cause a bus hang
+ * that triggers the hardware watchdog (HWT) and forces a reboot.
+ *
+ * Fix: register a PM notifier that sets an atomic flag before freeze.
+ * All kprobe handlers, the relift delayed_work, and the GPU kthread
+ * check this flag and skip all HW access while suspended.
+ */
+static atomic_t kpm_suspended = ATOMIC_INIT(0);
 
 /* ─── CSRAM Configuration ───────────────────────────────────────────────── */
 /*
@@ -1608,6 +1623,9 @@ static int __nocfi freq_qos_kp_pre(struct kprobe *p, struct pt_regs *regs)
 	s32 new_value;
 	int c;
 
+	if (atomic_read(&kpm_suspended))
+		return 0;
+
 	req       = (struct freq_qos_request *)(uintptr_t)regs->regs[0];
 	new_value = (s32)regs->regs[1];
 
@@ -1654,6 +1672,9 @@ static int __nocfi userlimit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 	unsigned int new_max = (unsigned int)regs->regs[1];
 	unsigned int target;
 
+	if (atomic_read(&kpm_suspended))
+		return 0;
+
 	if (cluster < 0 || cluster >= NUM_CLUSTERS)
 		return 0;
 
@@ -1683,7 +1704,7 @@ static void __nocfi cpu_csram_resync_fast(void)
 {
 	int c;
 
-	if (!csram_base)
+	if (!csram_base || atomic_read(&kpm_suspended))
 		return;
 
 	for (c = 0; c < NUM_CLUSTERS; c++) {
@@ -1778,6 +1799,9 @@ static int __nocfi scmi_cpufreq_kp_pre(struct kprobe *p,
 					struct pt_regs *regs)
 {
 	unsigned int target_freq = (unsigned int)regs->regs[1];
+
+	if (atomic_read(&kpm_suspended))
+		return 0;
 
 	WRITE_ONCE(scmi_last_target_freq, target_freq);
 	atomic_inc(&scmi_cpufreq_hit_count);
@@ -2115,6 +2139,12 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 	if (!cpu_oc_relift_active)
 		return;
 
+	/* Skip while system is suspended — cpufreq policies and
+	 * freq_qos infrastructure may not be in a safe state.
+	 */
+	if (atomic_read(&kpm_suspended))
+		goto reschedule;
+
 	for (c = 0; c < NUM_CLUSTERS; c++) {
 		unsigned int target = cpu_oc_targets[c];
 		struct cpufreq_policy *policy;
@@ -2224,6 +2254,7 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 	/* Safety net: event-driven sync handles transitions, this catches misses. */
 	cpu_reapply_volt_overrides_locked();
 
+reschedule:
 	if (cpu_oc_relift_active)
 		schedule_delayed_work(&cpu_oc_relift_dwork,
 				      msecs_to_jiffies(RELIFT_INTERVAL_MS));
@@ -2405,6 +2436,9 @@ static int __nocfi gpu_commit_kretp_ret(struct kretprobe_instance *ri,
 		(struct gpu_commit_kretp_data *)ri->data;
 	unsigned int tgt = READ_ONCE(gpu_target_freq);
 	int ret_val = (int)regs_return_value(regs);
+
+	if (atomic_read(&kpm_suspended))
+		return 0;
 
 	/* Only override PLL when:
 	 * 1) commit succeeded (ret == 0)
@@ -2768,7 +2802,7 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 	int i;
 	static unsigned long last_log_jiffies;
 
-	if (tgt_freq == 0)
+	if (tgt_freq == 0 || atomic_read(&kpm_suspended))
 		return 0;
 
 	/* Clamp to PLL hardware max to prevent __gpufreq_abort on commit */
@@ -2866,6 +2900,13 @@ static int __nocfi gpu_oc_kthread_fn(void *data)
 		msleep(GPU_RELIFT_INTERVAL_MS);
 
 		if (READ_ONCE(gpu_target_freq) == 0)
+			continue;
+
+		/* Skip while system is suspended — GPU (MFG domain) is
+		 * powered off, any MMIO/function-pointer access would
+		 * cause a bus hang and HWT reboot.
+		 */
+		if (atomic_read(&kpm_suspended))
 			continue;
 
 		mutex_lock(&lock);
@@ -3363,6 +3404,33 @@ module_param_cb(cpu_volt_override, &cpu_volt_ov_ops, &cpu_volt_ov_dummy, 0220);
 MODULE_PARM_DESC(cpu_volt_override,
 		 "Per-LUT CPU voltage override: 'cl:idx:volt_uv ...' (CSRAM direct)");
 
+/* ─── PM Suspend/Resume Notifier ────────────────────────────────────────── */
+
+static int kpm_oc_pm_notify(struct notifier_block *nb,
+			    unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		atomic_set(&kpm_suspended, 1);
+		/* Let in-flight kprobe handlers drain */
+		synchronize_rcu();
+		pr_info("KPM_OC: suspend — HW access paused\n");
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+		atomic_set(&kpm_suspended, 0);
+		pr_info("KPM_OC: resume — HW access resumed\n");
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block kpm_oc_pm_nb = {
+	.notifier_call = kpm_oc_pm_notify,
+	.priority = 0,
+};
+
 /* ─── Module Init / Exit ────────────────────────────────────────────────── */
 
 static int __init kpm_oc_init(void)
@@ -3405,6 +3473,10 @@ static int __init kpm_oc_init(void)
 
 	snprintf(opp_table_export, sizeof(opp_table_export), "READY");
 	INIT_DELAYED_WORK(&cpu_oc_relift_dwork, cpu_oc_relift_work_fn);
+
+	/* Register PM notifier to pause HW access during suspend */
+	register_pm_notifier(&kpm_oc_pm_nb);
+
 	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v8.1 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
@@ -3561,6 +3633,7 @@ static int __init kpm_oc_init(void)
 
 static void __exit kpm_oc_exit(void)
 {
+	unregister_pm_notifier(&kpm_oc_pm_nb);
 	unregister_kprobe(&freq_qos_kp);
 	unregister_kprobe(&userlimit_kp);
 	unregister_kprobe(&scmi_fast_switch_kp);

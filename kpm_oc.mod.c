@@ -22,7 +22,7 @@ __section(".gnu.linkonce.this_module") = {
 	.arch = MODULE_ARCH_INIT,
 };
 
-MODULE_INFO(scmversion, "g9b5701d77850-dirty");
+MODULE_INFO(scmversion, "g335bc38d34b9-dirty");
 
 #ifdef CONFIG_RETPOLINE
 MODULE_INFO(retpoline, "Y");
