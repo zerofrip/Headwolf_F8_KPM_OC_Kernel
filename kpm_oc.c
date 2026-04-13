@@ -47,6 +47,7 @@
 #include <linux/workqueue.h>
 #include <linux/input.h>
 #include <linux/suspend.h>
+#include <linux/freezer.h>
 
 /* ─── Suspend/Resume Protection ─────────────────────────────────────────
  *
@@ -2891,12 +2892,16 @@ static int __nocfi gpu_oc_kthread_fn(void *data)
 	int miss_cnt = 0;
 	int last_state = 0;
 
+	set_freezable();
+
 	pr_info("KPM_OC: GPU relift kthread started (%d ms)\n",
 		GPU_RELIFT_INTERVAL_MS);
 
 	while (!kthread_should_stop()) {
 		int now;
 
+		if (try_to_freeze())
+			continue;
 		msleep(GPU_RELIFT_INTERVAL_MS);
 
 		if (READ_ONCE(gpu_target_freq) == 0)
@@ -3413,6 +3418,10 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 		atomic_set(&kpm_suspended, 1);
+		/* Cancel the periodic CPU relift worker so it cannot fire
+		 * during device suspend.  No-op if already not queued.
+		 */
+		cancel_delayed_work_sync(&cpu_oc_relift_dwork);
 		/* Let in-flight kprobe handlers drain */
 		synchronize_rcu();
 		pr_info("KPM_OC: suspend — HW access paused\n");
@@ -3420,6 +3429,10 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 		atomic_set(&kpm_suspended, 0);
+		/* Restart the periodic CPU relift worker after resume */
+		if (cpu_oc_relift_active)
+			schedule_delayed_work(&cpu_oc_relift_dwork,
+					      msecs_to_jiffies(RELIFT_INTERVAL_MS));
 		pr_info("KPM_OC: resume — HW access resumed\n");
 		break;
 	}
@@ -3428,7 +3441,7 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 
 static struct notifier_block kpm_oc_pm_nb = {
 	.notifier_call = kpm_oc_pm_notify,
-	.priority = 0,
+	.priority = INT_MAX,
 };
 
 /* ─── Module Init / Exit ────────────────────────────────────────────────── */
