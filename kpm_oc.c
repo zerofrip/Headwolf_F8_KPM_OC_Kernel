@@ -495,6 +495,10 @@ static unsigned long           pt_policy_list_sym; /* mtk_cpu_power_throttling l
 static struct delayed_work cpu_oc_relift_dwork;
 static bool cpu_oc_relift_active;
 static unsigned int cpu_oc_targets[NUM_CLUSTERS]; /* per-cluster OC target KHz, 0=off */
+/* Saved stock CSRAM LUT[0] raw values — restored before suspend so MCUPM
+ * does not attempt DDS calculation on the OC'd frequency during deep sleep.
+ */
+static u32 cpu_oc_orig_lut0[NUM_CLUSTERS];
 /* Cached &policy->constraints per cluster for kprobe interception */
 static struct freq_constraints *cluster_qos_ptr[NUM_CLUSTERS];
 
@@ -1422,6 +1426,12 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 		orig_lut      = readl_relaxed(csram_base + dom_base + REG_FREQ_LUT);
 		orig_freq_mhz = orig_lut & LUT_FREQ_MASK;
 		orig_volt_uv  = LUT_VOLT_DECODE(orig_lut);
+
+		/* Save stock LUT[0] before first patch (for suspend restore).
+		 * Only save when value looks like a stock entry (not already OC'd).
+		 */
+		if (cpu_oc_orig_lut0[c] == 0)
+			cpu_oc_orig_lut0[c] = orig_lut;
 
 		if (orig_freq_mhz < 100 || orig_freq_mhz > 5000)
 			pr_warn("KPM_OC: CPU %s LUT[0] unexpected freq=%u MHz (repairing)\n",
@@ -3411,6 +3421,101 @@ MODULE_PARM_DESC(cpu_volt_override,
 
 /* ─── PM Suspend/Resume Notifier ────────────────────────────────────────── */
 
+/*
+ * Restore stock CSRAM LUT[0] values before suspend so that MCUPM reads
+ * the original (stock) frequency during deep sleep.  Without this, MCUPM
+ * calculates DDS from the OC'd value (e.g. 4000 MHz), which causes an
+ * inconsistency that triggers SSPM WDT silent reset.
+ */
+static void cpu_csram_restore_stock(void)
+{
+	int c, i;
+
+	if (!csram_base)
+		return;
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int dom_base = domain_offsets[c];
+
+		/* Restore LUT[0] to saved stock value */
+		if (cpu_oc_targets[c] && cpu_oc_orig_lut0[c]) {
+			writel_relaxed(cpu_oc_orig_lut0[c],
+				       csram_base + dom_base + REG_FREQ_LUT);
+			pr_info("KPM_OC: suspend: %s LUT[0] restored to 0x%08x (%uMHz)\n",
+				cluster_names[c], cpu_oc_orig_lut0[c],
+				cpu_oc_orig_lut0[c] & LUT_FREQ_MASK);
+		}
+
+		/* Restore per-entry voltage overrides to stock */
+		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			if (cpu_volt_ov[c][i] && cpu_orig_volt[c][i]) {
+				u32 cur = readl_relaxed(csram_base + dom_base +
+							REG_FREQ_LUT +
+							i * LUT_ROW_SIZE);
+				u32 restored = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+					       ((cpu_orig_volt[c][i] / 10) << 12);
+				writel_relaxed(restored, csram_base + dom_base +
+					       REG_FREQ_LUT + i * LUT_ROW_SIZE);
+			}
+		}
+	}
+	wmb();
+}
+
+/*
+ * Re-apply OC'd CSRAM LUT[0] values after resume.
+ * Only touches CSRAM — cpufreq policy is already configured.
+ */
+static void cpu_csram_reapply_oc(void)
+{
+	static unsigned int * const tgt_volts[] = {
+		&cpu_oc_l_volt, &cpu_oc_b_volt, &cpu_oc_p_volt
+	};
+	int c, i;
+
+	if (!csram_base)
+		return;
+
+	for (c = 0; c < NUM_CLUSTERS; c++) {
+		unsigned int target_khz = cpu_oc_targets[c];
+		unsigned int dom_base = domain_offsets[c];
+
+		if (target_khz > 0 && cpu_oc_orig_lut0[c]) {
+			unsigned int target_uv = READ_ONCE(*tgt_volts[c]);
+			unsigned int new_freq_mhz = target_khz / 1000;
+			u32 new_lut;
+
+			if (target_uv == 0)
+				target_uv = LUT_VOLT_DECODE(cpu_oc_orig_lut0[c]);
+
+			new_lut = (cpu_oc_orig_lut0[c] & LUT_GEAR_MASK) |
+				  (new_freq_mhz & LUT_FREQ_MASK) |
+				  ((target_uv / 10) << 12);
+			writel_relaxed(new_lut, csram_base + dom_base +
+				       REG_FREQ_LUT);
+			pr_info("KPM_OC: resume: %s LUT[0] re-applied 0x%08x (%uMHz@%uuV)\n",
+				cluster_names[c], new_lut, new_freq_mhz,
+				target_uv);
+		}
+
+		/* Re-apply per-entry voltage overrides */
+		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			unsigned int ov = cpu_volt_ov[c][i];
+			u32 cur, patched;
+
+			if (!ov)
+				continue;
+			cur = readl_relaxed(csram_base + dom_base +
+					    REG_FREQ_LUT + i * LUT_ROW_SIZE);
+			patched = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+				  ((ov / 10) << 12);
+			writel_relaxed(patched, csram_base + dom_base +
+				       REG_FREQ_LUT + i * LUT_ROW_SIZE);
+		}
+	}
+	wmb();
+}
+
 static int kpm_oc_pm_notify(struct notifier_block *nb,
 			    unsigned long action, void *data)
 {
@@ -3424,16 +3529,24 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 		cancel_delayed_work_sync(&cpu_oc_relift_dwork);
 		/* Let in-flight kprobe handlers drain */
 		synchronize_rcu();
-		pr_info("KPM_OC: suspend — HW access paused\n");
+		/* Restore stock CSRAM LUT[0] so MCUPM does not see OC'd
+		 * frequencies during deep sleep (prevents SSPM WDT reset).
+		 */
+		cpu_csram_restore_stock();
+		pr_info("KPM_OC: suspend — CSRAM restored to stock, HW access paused\n");
 		break;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
+		/* Re-apply OC before clearing suspended flag so kprobe
+		 * handlers see the OC'd values immediately on resume.
+		 */
+		cpu_csram_reapply_oc();
 		atomic_set(&kpm_suspended, 0);
 		/* Restart the periodic CPU relift worker after resume */
 		if (cpu_oc_relift_active)
 			schedule_delayed_work(&cpu_oc_relift_dwork,
 					      msecs_to_jiffies(RELIFT_INTERVAL_MS));
-		pr_info("KPM_OC: resume — HW access resumed\n");
+		pr_info("KPM_OC: resume — CSRAM OC re-applied, HW access resumed\n");
 		break;
 	}
 	return NOTIFY_DONE;
