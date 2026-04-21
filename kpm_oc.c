@@ -32,6 +32,19 @@
  *         - set_cpu_oc freq_table update: always writes tbl[0].frequency
  *           instead of searching for the max-freq entry. Fixes re-OC
  *           after underclock where index 0 held the underclocked value.
+ *   v8.2: Integrated suspend-noirq precision shield (replaces the separate
+ *         kpm_fix module).  Addresses the residual silent-reset observed
+ *         during deep sleep on MT6897 even after CSRAM stock restore: the
+ *         vendor CCCI/DPMAIF drv3_suspend_noirq callback powers down the
+ *         DPMAIF IP while the AP-side power domain is already collapsing,
+ *         which leaves the bus in an inconsistent state and trips the
+ *         SSPM/HWT silent WDT.  The new precision shield sets PC = LR at
+ *         function entry for a hand-picked list of noirq callbacks so the
+ *         PM core sees a successful (zero) return and S2idle can proceed.
+ *         The shield is gated on the existing kpm_suspended atomic so it
+ *         is only ever active while the PM notifier has confirmed a
+ *         suspend cycle is in flight.  Defaults on; toggle with the
+ *         noirq_shield_enabled module param.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -3557,6 +3570,150 @@ static struct notifier_block kpm_oc_pm_nb = {
 	.priority = INT_MAX,
 };
 
+/* ─── Suspend-NoIRQ Precision Shield ────────────────────────────────────── *
+ *
+ * On Headwolf F8 (MT6897 / Dimensity 8300), console-ramoops from every
+ * sleep-induced reboot ends with the exact same signature:
+ *
+ *     [SCP] scp_suspend_cb
+ *     [ccci0/dpmf][dpmaif_suspend_noirq] dev: 0x…
+ *     [ccci1/drv3][drv3_suspend_noirq] power down=0
+ *     <silent reset>
+ *
+ * The faulting sequence is:
+ *   1. PM core completes device_suspend() cleanly.
+ *   2. dpm_suspend_noirq() reaches the CCCI/DPMAIF noirq callbacks.
+ *   3. drv3_suspend_noirq() writes to DPMAIF registers while the AP-side
+ *      modem power domain is already collapsing; the AXI transaction
+ *      never completes, SSPM/MCUPM observes a heartbeat miss and asserts
+ *      the silent HWT reset.
+ *
+ * Restoring CSRAM to stock LUT[0] before freeze is not sufficient — the
+ * crash lives entirely inside the vendor noirq callback, not in any
+ * voltage/frequency state we control.  The only reliable fix is to skip
+ * the body of the offending callbacks; when they are bypassed the modem
+ * IP stays in its post-device-suspend state (already quiesced by the
+ * normal suspend phase), the SoC reaches S2idle, and the device wakes
+ * cleanly on the next WoW/RTC/key event.
+ *
+ * Implementation: pre-handler kprobe at each function entry.  When the
+ * shield is active the handler overwrites PC with LR and x0 with 0, then
+ * returns 1 so the kprobe framework resumes at the faked return address
+ * instead of single-stepping into the body.  The shield is gated on the
+ * kpm_suspended atomic so it can never perturb normal runtime execution
+ * (these callbacks are only ever invoked during suspend, but the guard
+ * makes the invariant explicit and lets us disable it at runtime via the
+ * noirq_shield_enabled module param).
+ */
+
+static atomic_t kpm_noirq_shield_hits = ATOMIC_INIT(0);
+static bool kpm_noirq_shield_enabled = true;
+module_param_named(noirq_shield_enabled, kpm_noirq_shield_enabled, bool, 0644);
+MODULE_PARM_DESC(noirq_shield_enabled,
+		 "Shield vendor noirq suspend callbacks (drv3/dpmaif/ccif/ccci_modem/scp/mminfra) to prevent silent sleep resets. Default: on.");
+
+static int __nocfi kpm_noirq_shield_handler(struct kprobe *p,
+					    struct pt_regs *regs)
+{
+	if (!READ_ONCE(kpm_noirq_shield_enabled))
+		return 0;
+
+	/* Only active while a suspend cycle is in progress; the PM notifier
+	 * sets kpm_suspended on PM_SUSPEND_PREPARE and clears it on
+	 * PM_POST_SUSPEND.  Outside that window we must never alter PC.
+	 */
+	if (!atomic_read(&kpm_suspended))
+		return 0;
+
+	/* Fake a zero-return: set x0 = 0 and branch to LR.  These vendor
+	 * callbacks are int-returning suspend ops; PM core treats ret == 0
+	 * as success and continues the noirq phase normally.
+	 */
+	regs->regs[0] = 0;
+	regs->pc = regs->regs[30];
+
+	/* Rate-limited so we can prove the shield fired on the first
+	 * post-install suspend without spamming the ring buffer on every
+	 * subsequent sleep.
+	 */
+	if (atomic_inc_return(&kpm_noirq_shield_hits) <= 64)
+		pr_info("KPM_OC: noirq shield [%s]\n", p->symbol_name);
+
+	return 1;
+}
+
+#define KPM_OC_DEFINE_NOIRQ_SHIELD(sym)						\
+	static struct kprobe kpm_noirq_kp_##sym = {				\
+		.symbol_name = #sym,						\
+		.pre_handler = kpm_noirq_shield_handler,			\
+	}
+
+/* Primary crash gateway: ccci_dpmaif drv3 noirq. */
+KPM_OC_DEFINE_NOIRQ_SHIELD(drv3_suspend_noirq);
+/* Same module (ccci_dpmaif); shielded together so a future SoC variant
+ * that takes the dpmaif path directly is still covered.
+ */
+KPM_OC_DEFINE_NOIRQ_SHIELD(dpmaif_suspend_noirq);
+/* ccci_ccif noirq — adjacent CCCI IP that can trip the same AXI hang. */
+KPM_OC_DEFINE_NOIRQ_SHIELD(ccif_suspend_noirq);
+/* Top-level modem suspend hook (ccci_md_all). */
+KPM_OC_DEFINE_NOIRQ_SHIELD(ccci_modem_suspend);
+/* SCP suspend callback — last message before the noirq crash in some
+ * ramoops captures, so shield it too.
+ */
+KPM_OC_DEFINE_NOIRQ_SHIELD(scp_suspend_cb);
+/* MMInfra noirq — also implicated in the earlier v12 reboot logs. */
+KPM_OC_DEFINE_NOIRQ_SHIELD(mminfra_pm_suspend_noirq);
+
+static struct kprobe *kpm_noirq_shield_kprobes[] = {
+	&kpm_noirq_kp_drv3_suspend_noirq,
+	&kpm_noirq_kp_dpmaif_suspend_noirq,
+	&kpm_noirq_kp_ccif_suspend_noirq,
+	&kpm_noirq_kp_ccci_modem_suspend,
+	&kpm_noirq_kp_scp_suspend_cb,
+	&kpm_noirq_kp_mminfra_pm_suspend_noirq,
+};
+
+static int kpm_noirq_shield_register(void)
+{
+	int i, ok = 0;
+
+	for (i = 0; i < ARRAY_SIZE(kpm_noirq_shield_kprobes); i++) {
+		struct kprobe *kp = kpm_noirq_shield_kprobes[i];
+		int rc = register_kprobe(kp);
+
+		if (rc < 0) {
+			pr_warn("KPM_OC: noirq shield kprobe [%s] register failed (%d)\n",
+				kp->symbol_name, rc);
+			/* Ensure we don't try to unregister an unarmed probe
+			 * on module unload.
+			 */
+			kp->addr = NULL;
+			continue;
+		}
+		ok++;
+	}
+
+	pr_info("KPM_OC: noirq shield armed (%d/%zu probes, enabled=%d)\n",
+		ok, ARRAY_SIZE(kpm_noirq_shield_kprobes),
+		kpm_noirq_shield_enabled);
+	return ok;
+}
+
+static void kpm_noirq_shield_unregister(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(kpm_noirq_shield_kprobes); i++) {
+		struct kprobe *kp = kpm_noirq_shield_kprobes[i];
+
+		if (kp->addr)
+			unregister_kprobe(kp);
+	}
+	pr_info("KPM_OC: noirq shield disarmed (total hits: %d)\n",
+		atomic_read(&kpm_noirq_shield_hits));
+}
+
 /* ─── Module Init / Exit ────────────────────────────────────────────────── */
 
 static int __init kpm_oc_init(void)
@@ -3603,7 +3760,13 @@ static int __init kpm_oc_init(void)
 	/* Register PM notifier to pause HW access during suspend */
 	register_pm_notifier(&kpm_oc_pm_nb);
 
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v8.1 (base=0x%lx)\n",
+	/* Arm the suspend-noirq precision shield.  Must run after the PM
+	 * notifier is registered so the kpm_suspended gate is reliable
+	 * before the first user-triggered sleep after insmod.
+	 */
+	kpm_noirq_shield_register();
+
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v8.2 (base=0x%lx)\n",
 		CSRAM_PHYS_BASE);
 
 	/* Register kprobes for freq_qos and userlimit interception */
@@ -3760,6 +3923,7 @@ static int __init kpm_oc_init(void)
 static void __exit kpm_oc_exit(void)
 {
 	unregister_pm_notifier(&kpm_oc_pm_nb);
+	kpm_noirq_shield_unregister();
 	unregister_kprobe(&freq_qos_kp);
 	unregister_kprobe(&userlimit_kp);
 	unregister_kprobe(&scmi_fast_switch_kp);
@@ -3794,4 +3958,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass v8.0");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass + noirq shield v8.2");
