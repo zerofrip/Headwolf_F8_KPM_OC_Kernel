@@ -1,6 +1,6 @@
 # Headwolf F8 KPM OC Kernel Module
 
-Kernel module (v8.1) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
+Kernel module (**v11.6**) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 
 - **CPU OPP reader** — exports CSRAM LUT data to userspace via live sysfs reads (re-reads CSRAM on every access)
 - **CPU overclocking** — patches CSRAM LUT[0] per cluster + updates cpufreq policy max
@@ -12,8 +12,10 @@ Kernel module (v8.1) for MediaTek MT8792 (Dimensity 8300 / MT6897) providing:
 - **GPU PLL direct programming** *(v8.0)* — direct MFG PLL CON1 register writes for above-stock GPU frequency; kretprobe on `gpufreq_commit` reprograms PLL after GPUEB commits
 - **FHCTL / MCU PLL hopping** *(v8.0)* — IPI-based PLL frequency control via MCUPM fhctl interface; captures `mcupm_hopping_v1` calls for diagnostics
 - **SCMI DVFS capture & override** *(v8.0)* — kprobes on `scmi_perf_level_set` / `scmi_dvfs_freq_set` for diagnostics and optional performance level override
+- **Suspend stability tracer** *(v11.3–v11.6)* — opt-in `suspend_trace_enabled` module parameter installs `KPMTRACE` / `KPMNOIRQ` / `KPMPHASE` kretprobes on `dpm_run_callback`, `__device_suspend_noirq`, and the post-noirq pipeline (`dpm_suspend_noirq`, `syscore_suspend`, `freeze_secondary_cpus`, `cpuidle_enter_s2idle`, `cpuidle_enter_state`, `psci_cpu_suspend_enter`, `psci_system_suspend_enter`, `cpu_suspend`, `pm_suspend_default_s2idle`) so the last unmatched "enter" in `console-ramoops-0` after a watchdog reboot pinpoints the hanging stage
+- **Sleep-reboot recovery** *(paired with the APatch `f8_sleep_reboot_guard` wakelock)* — dynamic tracing with this module identified the reboot as a probabilistic PSCI / ATF / MCUPM firmware hang during multi-cluster shutdown on the `s2idle` path; the kernel side cannot fully patch it, so the APatch module blocks `s2idle` entry with a permanent wakelock while cpuidle states 0–6 (up to `system-bus`) remain fully enabled for normal idle power savings
 
-Used by the [APatch module (v10.7)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, per-section split config persistence (`conf/*.json`) with per-section Apply buttons, legacy config auto-migration, and a boot-time service with gaming monitor daemon.
+Used by the [APatch module (**v13.0**)](https://github.com/zerofrip/Headwolf_F8_KPM_OC_APatch) which provides: WebUI with 5 tabs (CPU/GPU/RAM/Storage/Profile), multi-language support (EN/JA), thermal mitigation, power profiles (Battery Save / Normal / Performance), auto gaming mode with foreground app detection and app icon display, per-section split config persistence (`conf/*.json`) with per-section Apply buttons, legacy config auto-migration, boot-time service with gaming monitor daemon, and the permanent sleep-reboot workaround (`f8_sleep_reboot_guard` wakelock).
 
 ## Hardware Details
 
@@ -252,6 +254,91 @@ cat /proc/gpufreqv2/gpu_working_opp_table | head -5
 | `pll_scan` | W | Dump MCU PLL CON0-3, FHCTL registers |
 | `perf_scan` | W | Dump CSRAM `perf_state` + `hw_state` per domain |
 | `kvm_read_trigger` | W | Read 256 bytes at a kernel virtual address (debug) |
+
+## Suspend Stability & Sleep-Reboot Investigation (v11.0–v11.6)
+
+Stock F8 firmware probabilistically watchdog-resets the device while the
+screen is off.  v11.0–v11.6 iteratively added targeted kretprobe tracers
+that survive a cold reset via `pstore` / `console-ramoops-0`, narrowing
+the hang down one suspend phase at a time.
+
+### Tracer design
+
+All tracers are **compiled in but dormant** until `suspend_trace_enabled`
+is set to `Y` — they add zero runtime cost in the default shipping
+configuration.
+
+| Log tag | Hooks | Emits (pr_emerg) |
+|---------|-------|------------------|
+| `KPMTRACE` | `dpm_run_callback` (kretprobe) | `enter/exit dev=<name> drv=<drv> info=<prepare|suspend|resume|noirq|late> rc=<ret>` |
+| `KPMNOIRQ` | `__device_suspend_noirq` (kretprobe) | `enter/exit dev=<name> drv=<drv> rc=<ret>` — drv=(none) pseudo-devices are filtered |
+| `KPMPHASE` | `dpm_suspend_noirq`, `syscore_suspend`, `freeze_secondary_cpus`, `cpuidle_enter_s2idle`, `cpuidle_enter_state`, `psci_cpu_suspend_enter`, `psci_system_suspend_enter`, `cpu_suspend`, `pm_suspend_default_s2idle` (kretprobes) | `enter/exit <fn> [rc=<ret>]` |
+
+After a reboot, the **last `enter` with no matching `exit`** in
+`/sys/fs/pstore/console-ramoops-0` identifies the hanging stage.
+
+```bash
+# Arm the tracer and drop the APatch sleep-guard wakelock, then screen off:
+su -c sh /data/adb/modules/f8_kpm_oc_manager/tools/suspend_trace_arm.sh
+
+# After the next reboot, reconnect USB and run:
+su -c sh /data/adb/modules/f8_kpm_oc_manager/tools/suspend_trace_extract.sh
+
+# If the device survived without crashing, disarm and re-apply the guard:
+su -c sh /data/adb/modules/f8_kpm_oc_manager/tools/suspend_trace_disarm.sh
+```
+
+### Root cause (confirmed)
+
+1. **Full `dpm_suspend_noirq` completes cleanly** — the last `KPMNOIRQ`
+   line is always `exit dev=platform drv=(none) rc=0`, and `KPMPHASE`
+   records `exit dpm_suspend_noirq rc=0`.
+2. Control passes to `cpuidle_enter_s2idle` → `psci_cpu_suspend_enter`
+   → `cpu_suspend`, which issues a **PSCI SMC into EL3**.
+3. After a variable number of successful round-trips (returning
+   `rc=6` for `system-bus` or `rc=2` for `clusteroff`), one PSCI call
+   **never returns**.  Every other CPU is also blocked in PSCI; the
+   hardware watchdog fires ≈20–30 s later.
+4. Hang probability scales with idle state depth: `system-bus` hangs in
+   ~100 ms, `clusteroff` in seconds to minutes, `cpuoff` and `WFI`
+   not observed to hang.
+
+This pattern is a **proprietary-firmware bug in the MT6897 ATF / MCUPM /
+SPM coordination of multi-cluster shutdown during `s2idle`**.  It is
+not fixable from the kernel side — the PSCI SMC entry returns to a
+Secure Monitor that already lost its own scheduler invariant.
+
+### Permanent workaround (shipped)
+
+Because the firmware cannot be patched, the APatch module holds a
+persistent `f8_sleep_reboot_guard` kernel wakelock at boot to block
+`s2idle` entry.  Normal `cpuidle` (states 0–6, up to `system-bus`) is
+left fully enabled, so idle power consumption during screen-off is
+unchanged — only the broken suspend-to-idle transition is avoided.
+
+```bash
+# Verify the live configuration
+cat /sys/power/wake_lock                               # f8_sleep_reboot_guard
+cat /sys/module/kpm_oc/parameters/suspend_trace_enabled # N (dormant tracer)
+for d in /sys/devices/system/cpu/cpu0/cpuidle/state*; do
+    echo "$(basename $d) $(cat $d/name) disable=$(cat $d/disable)"
+done
+# state0 WFI             disable=0
+# state1 cpuoff-l        disable=0
+# state2 clusteroff-l    disable=0
+# state3 mcusysoff-l     disable=0
+# state4 system-mem      disable=0
+# state5 system-pll      disable=0
+# state6 system-bus      disable=0
+# state7 system-vcore    disable=1   (MTK default)
+# state8 s2idle          disable=1   (MTK default)
+```
+
+### Suspend-related module parameter
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `suspend_trace_enabled` | `N` | When `Y`, all `KPMTRACE` / `KPMNOIRQ` / `KPMPHASE` kretprobes emit `pr_emerg` entry/exit lines during every suspend cycle so `console-ramoops-0` preserves the exact stage reached before a watchdog hang.  When `N`, all probe handlers early-return (no overhead). |
 
 ## Not Implemented / Known Limitations
 

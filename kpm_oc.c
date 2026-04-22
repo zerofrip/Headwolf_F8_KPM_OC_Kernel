@@ -4470,7 +4470,7 @@ static int __init kpm_oc_init(void)
 	kpm_noirq_shield_register();
 	kpm_suspend_retfix_register();
 
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v11.2 (base=0x%lx, dpm_shield=%d)\n",
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v11.6 (base=0x%lx, dpm_shield=%d)\n",
 		CSRAM_PHYS_BASE, kpm_dpm_shield_enabled);
 
 	/* Register kprobes for freq_qos and userlimit interception */
@@ -4666,4 +4666,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass + noirq shield v11.2");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass + noirq shield + suspend tracer v11.6");
