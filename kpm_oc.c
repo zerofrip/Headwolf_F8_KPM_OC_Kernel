@@ -45,6 +45,120 @@
  *         is only ever active while the PM notifier has confirmed a
  *         suspend cycle is in flight.  Defaults on; toggle with the
  *         noirq_shield_enabled module param.
+ *   v8.3: Extend noirq shield set for the post-v8.2 terminal path
+ *         (lvts_suspend_noirq -> mtk_uarthub_suspend) observed in new
+ *         crash logs.
+ *   v8.4: Add suspend return safety-net kretprobes
+ *         (mt6375_auxadc_suspend_late/mmc_bus_suspend/alarmtimer_suspend)
+ *         to coerce transient negative returns to 0 during active suspend.
+ *   v8.5: Expand noirq precision shield to UART suspend stack
+ *         (mtk8250_suspend/serial8250_suspend/dw8250_suspend/uart_suspend_port)
+ *         for watchdog resets that terminate immediately after
+ *         mtk_uarthub_suspend.
+ *   v8.6: Restore the remaining proven shield set from the fix branch
+ *         (apu_top_suspend/mdla_suspend/mminfra_pm_suspend/
+ *          mtk_clk_mminfra_hwv_power_ctrl) to cover non-CCCI noirq hangs.
+ *   v8.7: Add generic dpm_run_callback shield for selected non-infra
+ *         devices (uarthub/uart/ccci/lvts/auxadc/mminfra/apu/mdla) so
+ *         wrapped or inlined suspend paths are also neutralized.
+ *   v8.8: Include clkbuf in the generic DPM shield and add
+ *         clk_buf_dev_pm_suspend precision shielding for watchdog resets
+ *         terminating at CLKBUF suspend dumps.
+ *   v8.9: Narrow generic DPM shielding to avoid CCCI/DPMAIF/CCIF infra
+ *         callbacks (keep those under precision noirq shields only).
+ *   v9.0: Disable generic dpm_run_callback shield by default
+ *         (dpm_shield_enabled=0) and rely on precision noirq shields +
+ *         suspend retfix as the stable baseline.
+ *   v9.1: Re-enable generic dpm shield with a strict whitelist
+ *         (uarthub/clkbuf/lvts/auxadc only), keeping modem paths out.
+ *   v9.2: Remove uarthub from generic dpm shield whitelist and keep it
+ *         under precision noirq shielding only.
+ *   v9.3: Add precision body-skip shields for mt6375_auxadc_suspend_late,
+ *         mmc_bus_suspend, and alarmtimer_suspend to avoid long retry/timeouts
+ *         that survive retfix and still trigger watchdog resets.
+ *   v9.4: Drop UART-family precision shields (uarthub/8250/uart core) and
+ *         keep stabilization focused on modem/mminfra/clkbuf/auxadc/mmc paths
+ *         to avoid over-shielding the serial power sequence.
+ *   v9.5: Re-enable only mtk_uarthub_suspend precision shield (keep 8250/core
+ *         UART shields disabled) for hangs terminating at uarthub suspend entry.
+ *   v9.6: Re-enable mtk8250_suspend + serial8250_suspend only
+ *         (keep dw8250/uart_suspend_port disabled) to catch
+ *         post-uarthub UART leaf hangs with minimal blast radius.
+ *   v9.7: Keep UART leaf shields, but default dpm_run_callback shield OFF
+ *         to avoid auxadc/lvts over-shielding near final suspend stage.
+ *   v9.8: Runtime panic mitigation: disable default above-stock GPU OC auto-apply.
+ *         GPU patch now auto-runs only when explicitly enabled or freq > stock.
+ *   v9.9: Make CPU/GPU OC auto-apply strictly opt-in by flags only.
+ *         Existing persisted target values no longer trigger auto OC at boot.
+ *   v10.0: Re-enable deeper UART noirq shields (dw8250_suspend,
+ *          uart_suspend_port) after repeated watchdog stops at
+ *          mtk_uarthub_suspend tail in sleep path.
+ *   v10.1: Re-enable generic dpm shield only for auxadc-class devices
+ *          to suppress recurrent mt6375 ADC wake/suspend callback loops.
+ *   v10.2: Add VCP to generic dpm shield target and reset per-suspend
+ *          shield counters so stop-point logs remain visible every cycle.
+ *   v10.3: Roll back generic dpm target scope to mt6375-only after
+ *          observing over-shielding stalls around vcp-iommu devices.
+ *   v10.4: Add only uarthub to generic dpm shield target to catch
+ *          wrapped callback paths while keeping vcp-iommu excluded.
+ *   v10.5: Remove uarthub from generic dpm shield after observed
+ *          over-shielding stalls at "dpm shield [uarthub]".
+ *   v10.6: Disable generic dpm shield by default again; keep only
+ *          precision noirq/retfix path to minimize callback interference.
+ *   v10.7: Add uarthub core-state helper shields to break potential
+ *          suspend-time readiness/clock polling loops after uarthub suspend.
+ *   v10.8: Add host wake/fw-own state helper shields in uarthub core
+ *          to suppress additional suspend-time uarthub polling loops.
+ *   v10.9: Add extra uarthub ready/clock/idle helper shields to cover
+ *          additional polling paths reached from mtk_uarthub_suspend.
+ *   v11.0: Disable top-level mtk_uarthub_suspend body-skip shield and
+ *          rely on lower-level uarthub_core_* shields for finer isolation.
+ *   v11.1: Re-enable top-level mtk_uarthub_suspend shield and add
+ *          uarthub core open/close/reset/txrx-request helper shields.
+ *   v11.2: Replace top-level mtk_uarthub_suspend body-skip with retfix
+ *          (force non-zero suspend return to 0) with core helper shields.
+ *   v11.3: Add suspend call tracer (suspend_trace_enabled module param).
+ *          Logs every dpm_run_callback entry AND exit (via kretprobe) to
+ *          pr_warn during an active suspend cycle so console-ramoops of a
+ *          silent watchdog reset identifies the exact hanging PM callback
+ *          (the final "KPMTRACE: enter" line with no matching "exit"
+ *          line is the culprit).  The tracer is always armed but dormant
+ *          until suspend_trace_enabled=Y is echoed into sysfs; the
+ *          kpm_suspended atomic is now tracked regardless of
+ *          suspend_hooks_enabled so the tracer works even when the heavier
+ *          CSRAM restore/reapply hooks are disabled.
+ *   v11.6: Add KPMPHASE tracer for the post-noirq suspend pipeline.
+ *          v11.5 field data proved the whole suspend_noirq phase (including
+ *          the final "platform" pseudo-device) completes cleanly before the
+ *          hang — the watchdog fires during one of the subsequent stages
+ *          (platform_suspend_prepare_noirq / s2idle_loop / s2idle_enter /
+ *          syscore_suspend / psci_cpu_suspend_enter / cpu_suspend).  The
+ *          new tracer hooks each of those with a single-line "KPMPHASE:
+ *          enter/exit <fn>" log at pr_emerg level; the last enter without a
+ *          matching exit in ramoops after a fresh watchdog reboot is the
+ *          stage owning the thread when the CPU goes dark.  Also filters
+ *          the v11.4 KPMNOIRQ output to skip drv=(none) pseudo-devices so
+ *          the 256 KiB pstore buffer stops being buried under bookkeeping
+ *          iteration noise.
+ *   v11.5: Remove KPMNOIRQ per-line print cap.  v11.4 hit cap (2048)
+ *          silently stopped tracing mid-phase so ramoops only covered the
+ *          first ~700 devices; pm_print_times clearly showed the phase
+ *          continued past that point (devapc, mtk_i2c, uarthub, tfa) before
+ *          the hang.  The pstore ring buffer already self-rotates, so the
+ *          cap was double-guarding and hiding the crash window.  Also
+ *          increased kretprobe maxactive to 128 for safety on deep nests.
+ *   v11.4: Add __device_suspend_noirq direct kretprobe (KPMNOIRQ tracer).
+ *          Field evidence showed the v11.3 dpm_run_callback kretprobe does
+ *          not fire during the suspend_noirq phase on this vendor kernel
+ *          (ramoops from a fresh watchdog reboot captured ~2000 KPMTRACE
+ *          lines but ZERO of them carried info=noirq), while pm_print_times
+ *          confirmed many noirq callbacks executed in that window.  The new
+ *          kretprobe hooks the PM core iteration function directly, emits
+ *          pr_emerg "KPMNOIRQ: enter/exit dev=<name> drv=<drv>" for every
+ *          device regardless of whether a noirq callback is registered and
+ *          is gated on the same suspend_trace_enabled flag.  The final
+ *          "KPMNOIRQ: enter" with no matching "KPMNOIRQ: exit" in
+ *          console-ramoops after a sleep reboot is the hanging device.
  *
  * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
@@ -583,6 +697,10 @@ MODULE_PARM_DESC(cpu_oc_p_freq, "P cluster (policy7) OC target in KHz (0=disable
 static unsigned int cpu_oc_p_volt;
 module_param(cpu_oc_p_volt, uint, 0644);
 MODULE_PARM_DESC(cpu_oc_p_volt, "P cluster OC volt in µV (0=keep original)");
+
+static bool cpu_auto_apply;
+module_param(cpu_auto_apply, bool, 0644);
+MODULE_PARM_DESC(cpu_auto_apply, "Auto-apply CPU OC at module load (default off)");
 
 static char cpu_oc_result[CPU_RESULT_BUF_SIZE];
 module_param_string(cpu_oc_result, cpu_oc_result, sizeof(cpu_oc_result), 0444);
@@ -2326,9 +2444,9 @@ static int          cpu_volt_ov_count;
 static unsigned int cpu_orig_volt[NUM_CLUSTERS][LUT_MAX_ENTRIES];
 
 /* Configurable via module params */
-static unsigned int gpu_target_freq = 1900000;
+static unsigned int gpu_target_freq = 1400000;
 module_param(gpu_target_freq, uint, 0644);
-MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq in KHz (default 1900000; hardware PLL max, signed OPP[0] OPP[0])");
+MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq in KHz (default 1400000 stock)");
 
 static unsigned int gpu_target_volt = 115040;
 module_param(gpu_target_volt, uint, 0644);
@@ -2337,6 +2455,10 @@ MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt in 10µV steps (default 11504
 static unsigned int gpu_target_vsram = 95000;
 module_param(gpu_target_vsram, uint, 0644);
 MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram in 10µV steps (default 95000 = 950mV)");
+
+static bool gpu_auto_apply;
+module_param(gpu_auto_apply, bool, 0644);
+MODULE_PARM_DESC(gpu_auto_apply, "Auto-apply GPU patch at module load (default off for stability)");
 
 /*
  * GPUEB stock max OPP freq (KHz).  Requests at or below this are satisfied
@@ -3529,13 +3651,60 @@ static void cpu_csram_reapply_oc(void)
 	wmb();
 }
 
+/* Forward declarations: defined in suspend shield sections below. */
+static atomic_t kpm_noirq_shield_hits;
+static atomic_t kpm_suspend_retfix_hits;
+static atomic_t kpm_suspend_trace_hits;
+static bool kpm_noirq_shield_enabled;
+static bool kpm_suspend_trace_enabled;
+static unsigned long kpm_last_suspend_prepare_jiffies;
+static int kpm_suspend_abort_streak;
+static bool kpm_suspend_hooks_enabled;
+module_param_named(suspend_hooks_enabled, kpm_suspend_hooks_enabled, bool, 0644);
+MODULE_PARM_DESC(suspend_hooks_enabled,
+		 "Enable KPM suspend notifier hooks (CSRAM restore/reapply). Default: off for suspend isolation.");
+
 static int kpm_oc_pm_notify(struct notifier_block *nb,
 			    unsigned long action, void *data)
 {
+	bool hooks_on = READ_ONCE(kpm_suspend_hooks_enabled);
+
+	/* Always track the suspend-in-progress state so that diagnostic
+	 * probes (suspend tracer, shield gates) have a reliable signal,
+	 * independent of whether the heavier CSRAM restore/reapply hooks
+	 * are enabled.  We only enter/exit the suspend window here; the
+	 * heavy CSRAM work further below is still gated on hooks_on.
+	 */
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
+		atomic_set(&kpm_noirq_shield_hits, 0);
+		atomic_set(&kpm_suspend_retfix_hits, 0);
+		atomic_set(&kpm_suspend_trace_hits, 0);
+		kpm_last_suspend_prepare_jiffies = jiffies;
 		atomic_set(&kpm_suspended, 1);
+		if (READ_ONCE(kpm_suspend_trace_enabled))
+			pr_warn("KPMTRACE: ===== suspend cycle begin =====\n");
+		break;
+	}
+
+	if (!hooks_on) {
+		/* Hooks disabled: still need to emit trace epilogue and
+		 * release kpm_suspended so tracing cannot latch on.
+		 */
+		if (action == PM_POST_SUSPEND ||
+		    action == PM_POST_HIBERNATION) {
+			if (READ_ONCE(kpm_suspend_trace_enabled))
+				pr_warn("KPMTRACE: ===== suspend cycle end (trace hits: %d) =====\n",
+					atomic_read(&kpm_suspend_trace_hits));
+			atomic_set(&kpm_suspended, 0);
+		}
+		return NOTIFY_DONE;
+	}
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
 		/* Cancel the periodic CPU relift worker so it cannot fire
 		 * during device suspend.  No-op if already not queued.
 		 */
@@ -3550,11 +3719,26 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 		break;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
+		/* If suspend bounces back repeatedly in <1s, our noirq
+		 * callback shields can become counterproductive and trigger
+		 * watchdog-driven userrequested reboot cycles. Auto-disable
+		 * the shield after several consecutive fast aborts.
+		 */
+		if (time_before(jiffies, kpm_last_suspend_prepare_jiffies +
+				msecs_to_jiffies(1000))) {
+			if (++kpm_suspend_abort_streak >= 3 &&
+			    READ_ONCE(kpm_noirq_shield_enabled)) {
+				WRITE_ONCE(kpm_noirq_shield_enabled, false);
+				pr_warn("KPM_OC: detected repeated fast suspend aborts, disabling noirq_shield_enabled\n");
+			}
+		} else {
+			kpm_suspend_abort_streak = 0;
+		}
+
 		/* Re-apply OC before clearing suspended flag so kprobe
 		 * handlers see the OC'd values immediately on resume.
 		 */
 		cpu_csram_reapply_oc();
-		atomic_set(&kpm_suspended, 0);
 		/* Restart the periodic CPU relift worker after resume */
 		if (cpu_oc_relift_active)
 			schedule_delayed_work(&cpu_oc_relift_dwork,
@@ -3562,6 +3746,14 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 		pr_info("KPM_OC: resume — CSRAM OC re-applied, HW access resumed\n");
 		break;
 	}
+
+	if (action == PM_POST_SUSPEND || action == PM_POST_HIBERNATION) {
+		if (READ_ONCE(kpm_suspend_trace_enabled))
+			pr_warn("KPMTRACE: ===== suspend cycle end (trace hits: %d) =====\n",
+				atomic_read(&kpm_suspend_trace_hits));
+		atomic_set(&kpm_suspended, 0);
+	}
+
 	return NOTIFY_DONE;
 }
 
@@ -3607,10 +3799,66 @@ static struct notifier_block kpm_oc_pm_nb = {
  */
 
 static atomic_t kpm_noirq_shield_hits = ATOMIC_INIT(0);
-static bool kpm_noirq_shield_enabled = true;
+static bool kpm_noirq_shield_enabled = false;
 module_param_named(noirq_shield_enabled, kpm_noirq_shield_enabled, bool, 0644);
 MODULE_PARM_DESC(noirq_shield_enabled,
 		 "Shield vendor noirq suspend callbacks (drv3/dpmaif/ccif/ccci_modem/scp/mminfra) to prevent silent sleep resets. Default: on.");
+static bool kpm_dpm_shield_enabled = false;
+module_param_named(dpm_shield_enabled, kpm_dpm_shield_enabled, bool, 0644);
+MODULE_PARM_DESC(dpm_shield_enabled,
+		 "Enable generic dpm_run_callback shield (narrow whitelist). Default: on.");
+
+/* ─── Suspend Call Tracer (diagnostic, off by default) ──────────────────── *
+ *
+ * When enabled, every PM callback invoked through dpm_run_callback() during
+ * a system-wide suspend cycle is logged at pr_warn level, with matching
+ * entry / exit lines carrying the device name, the callback kind string
+ * (e.g. "noirq suspend"), the callback function address, the return code,
+ * and the elapsed time in microseconds.  The last unmatched "enter" line in
+ * console-ramoops after a silent watchdog reset identifies the exact device
+ * whose PM callback hung — the root cause we cannot otherwise observe because
+ * vendor noirq callbacks typically do not print on entry and the ftrace
+ * ring-buffer is volatile.
+ *
+ * The tracer gates itself on kpm_suspended so it never logs during runtime
+ * PM transitions; only real system suspend cycles emit tracer output.
+ */
+static bool kpm_suspend_trace_enabled = false;
+module_param_named(suspend_trace_enabled, kpm_suspend_trace_enabled, bool, 0644);
+MODULE_PARM_DESC(suspend_trace_enabled,
+		 "Log every dpm_run_callback entry/exit during system suspend to identify hanging PM callbacks from console-ramoops. Default: off.");
+
+/* Atomic counter so we can rate-limit extreme spam and verify the tracer
+ * fired during a given suspend cycle.
+ */
+static atomic_t kpm_suspend_trace_hits = ATOMIC_INIT(0);
+
+static int kpm_dummy_suspend_cb(struct device *dev)
+{
+	return 0;
+}
+
+static bool kpm_is_infra_dev(const char *name)
+{
+	if (!name)
+		return false;
+	return strstr(name, "watchdog") || strstr(name, "mtk-wdt") ||
+	       strstr(name, "timer") || strstr(name, "clk") ||
+	       strstr(name, "regulator") || strstr(name, "pinctrl") ||
+	       strstr(name, "syscon") || strstr(name, "psci") ||
+	       strstr(name, "ramoops");
+}
+
+static bool kpm_is_shieldable_dev(const char *name)
+{
+	if (!name)
+		return false;
+	/* Strict whitelist only. Include modem path to cover devices where
+	 * vendor noirq symbol probes are unavailable.
+	 */
+	return strstr(name, "ccci") ||
+	       strstr(name, "dpmaif");
+}
 
 static int __nocfi kpm_noirq_shield_handler(struct kprobe *p,
 					    struct pt_regs *regs)
@@ -3642,6 +3890,298 @@ static int __nocfi kpm_noirq_shield_handler(struct kprobe *p,
 	return 1;
 }
 
+/* Generic PM shield: rewrite selected dpm callbacks to a dummy 0-return
+ * function. This catches vendor callback paths that don't expose stable
+ * symbol names (or are inlined/wrapped) while keeping infra devices intact.
+ *
+ * dpm_run_callback(callback, dev, state, info):
+ *   x0=callback fn ptr, x1=struct device *dev on arm64.
+ */
+static int __nocfi kpm_dpm_run_cb_shield(struct kprobe *p, struct pt_regs *regs)
+{
+	struct device *dev;
+	const char *name;
+	const char *info;
+	void *cb;
+
+	dev = (struct device *)(uintptr_t)regs->regs[1];
+	cb = (void *)(uintptr_t)regs->regs[0];
+	info = (const char *)(uintptr_t)regs->regs[3];
+	name = dev ? dev_name(dev) : NULL;
+
+	/* Diagnostic tracer: log every PM callback entry during system
+	 * suspend so a silent watchdog reset can be attributed to a specific
+	 * device.  Gated on kpm_suspended so normal runtime PM transitions
+	 * stay quiet.
+	 */
+	if (READ_ONCE(kpm_suspend_trace_enabled) &&
+	    atomic_read(&kpm_suspended)) {
+		int hit = atomic_inc_return(&kpm_suspend_trace_hits);
+
+		if (hit <= 2048) {
+			pr_warn("KPMTRACE: enter dev=%s info=%s cb=%ps\n",
+				name ? name : "(null)",
+				info ? info : "(null)",
+				cb);
+		}
+	}
+
+	if (!READ_ONCE(kpm_dpm_shield_enabled))
+		return 0;
+	if (!READ_ONCE(kpm_noirq_shield_enabled))
+		return 0;
+	if (!atomic_read(&kpm_suspended))
+		return 0;
+
+	if (!name)
+		return 0;
+	if (kpm_is_infra_dev(name))
+		return 0;
+	if (!kpm_is_shieldable_dev(name))
+		return 0;
+
+	regs->regs[0] = (u64)(uintptr_t)kpm_dummy_suspend_cb;
+	if (atomic_inc_return(&kpm_noirq_shield_hits) <= 64)
+		pr_info("KPM_OC: dpm shield [%s]\n", name);
+	return 0;
+}
+
+/* ─── dpm_run_callback return tracer ─────────────────────────────────────
+ *
+ * Paired with the entry tracer above.  Captures the return code of the
+ * callback we logged at entry, so after a silent reset we can see which
+ * enter line has no matching exit line — that is the hanging device.
+ *
+ * The entry-side handler stashes the device name pointer and the callback
+ * kind string so the exit line can print them even though the PM core has
+ * already moved the registers on.
+ */
+struct kpm_dpm_trace_ctx {
+	const char *dev_name;
+	const char *info;
+	void *cb;
+};
+
+static int __nocfi kpm_dpm_run_cb_entry(struct kretprobe_instance *ri,
+					struct pt_regs *regs)
+{
+	struct kpm_dpm_trace_ctx *ctx = (struct kpm_dpm_trace_ctx *)ri->data;
+	struct device *dev;
+
+	if (!READ_ONCE(kpm_suspend_trace_enabled) ||
+	    !atomic_read(&kpm_suspended)) {
+		ctx->dev_name = NULL;
+		ctx->info = NULL;
+		ctx->cb = NULL;
+		return 1;
+	}
+
+	dev = (struct device *)(uintptr_t)regs->regs[1];
+	ctx->dev_name = dev ? dev_name(dev) : NULL;
+	ctx->info = (const char *)(uintptr_t)regs->regs[3];
+	ctx->cb = (void *)(uintptr_t)regs->regs[0];
+	return 0;
+}
+
+static int __nocfi kpm_dpm_run_cb_exit(struct kretprobe_instance *ri,
+				       struct pt_regs *regs)
+{
+	struct kpm_dpm_trace_ctx *ctx = (struct kpm_dpm_trace_ctx *)ri->data;
+	int rc = (int)regs->regs[0];
+
+	if (!ctx->dev_name && !ctx->info && !ctx->cb)
+		return 0;
+
+	/* Only log when tracer still on to avoid partial pairs on teardown */
+	if (READ_ONCE(kpm_suspend_trace_enabled) &&
+	    atomic_read(&kpm_suspend_trace_hits) <= 2048) {
+		pr_warn("KPMTRACE: exit  dev=%s info=%s cb=%ps rc=%d\n",
+			ctx->dev_name ? ctx->dev_name : "(null)",
+			ctx->info ? ctx->info : "(null)",
+			ctx->cb, rc);
+	}
+	return 0;
+}
+
+static struct kretprobe kpm_dpm_run_krp = {
+	.kp.symbol_name = "dpm_run_callback",
+	.entry_handler = kpm_dpm_run_cb_entry,
+	.handler = kpm_dpm_run_cb_exit,
+	.data_size = sizeof(struct kpm_dpm_trace_ctx),
+	/* Enough for a full suspend phase on this SoC (~500 devices total). */
+	.maxactive = 1024,
+};
+
+/* ─── Per-device NoIRQ tracer ─────────────────────────────────────────────
+ *
+ * The kretprobe on dpm_run_callback above captures suspend / suspend_late
+ * phases but on this kernel build it does NOT fire during the suspend_noirq
+ * phase — vendor code paths or interrupt-disabled timing cause that probe
+ * to miss the critical window where the hang actually happens.  To capture
+ * every single device entry into the noirq phase we kprobe the PM core
+ * iteration function __device_suspend_noirq directly; it is called once
+ * per device with struct device *dev in x0 BEFORE any callback NULL-check
+ * or print, so the entry line is guaranteed to appear in ramoops even when
+ * the device has no explicit noirq callback.
+ */
+static atomic_t kpm_noirq_trace_hits = ATOMIC_INIT(0);
+
+struct kpm_noirq_ctx {
+	const char *name;
+	const char *drv;
+};
+
+static int __nocfi kpm_dev_susp_noirq_ent_krp(struct kretprobe_instance *ri,
+					      struct pt_regs *regs)
+{
+	struct device *dev;
+	struct kpm_noirq_ctx *ctx = (struct kpm_noirq_ctx *)ri->data;
+
+	if (!READ_ONCE(kpm_suspend_trace_enabled)) {
+		ctx->name = NULL;
+		ctx->drv = NULL;
+		return 1;
+	}
+
+	dev = (struct device *)(uintptr_t)regs->regs[0];
+	ctx->name = dev ? dev_name(dev) : NULL;
+	ctx->drv = (dev && dev->driver && dev->driver->name)
+			? dev->driver->name : NULL;
+
+	/* Only log devices that have an actual driver — this filters the huge
+	 * amount of "drv=(none)" bookkeeping entries (memoryN, cpu, platform,
+	 * dramc-chX-topY, pwrap-partition-N, etc.) which have no callback and
+	 * would otherwise drown out the pm_print_times lines in the 256 KiB
+	 * pstore ring buffer.  With this filter we keep the ramoops focused
+	 * on the meaningful noirq callbacks and leave room for the high-level
+	 * KPMPHASE markers that actually identify the post-noirq hang point.
+	 */
+	/* Skip (return 1) when no driver: no kretprobe slot is consumed and the
+	 * exit handler is not invoked.  With maxactive=128 and 500+ devices
+	 * per noirq phase we'd overflow the kretprobe pool if we kept an
+	 * instance alive for every pseudo-device. */
+	if (!ctx->drv)
+		return 1;
+
+	atomic_inc(&kpm_noirq_trace_hits);
+	pr_emerg("KPMNOIRQ: enter dev=%s drv=%s\n", ctx->name, ctx->drv);
+	return 0;
+}
+
+static int __nocfi kpm_dev_susp_noirq_exit(struct kretprobe_instance *ri,
+					   struct pt_regs *regs)
+{
+	struct kpm_noirq_ctx *ctx = (struct kpm_noirq_ctx *)ri->data;
+	int rc = (int)regs->regs[0];
+
+	/* Mirror the entry-side filter: only log devices that actually have a
+	 * driver (and thus meaningful noirq callbacks).  ctx->drv is NULL for
+	 * the bookkeeping pseudo-devices and we return 1 from the entry
+	 * handler in that case, so this path is a no-op for them anyway.
+	 */
+	if (READ_ONCE(kpm_suspend_trace_enabled) && ctx->drv) {
+		pr_emerg("KPMNOIRQ: exit  dev=%s drv=%s rc=%d\n",
+			 ctx->name ? ctx->name : "(unknown)",
+			 ctx->drv, rc);
+	}
+	return 0;
+}
+
+static struct kretprobe kpm_dev_susp_noirq_krp = {
+	.kp.symbol_name = "__device_suspend_noirq",
+	.entry_handler = kpm_dev_susp_noirq_ent_krp,
+	.handler = kpm_dev_susp_noirq_exit,
+	.data_size = sizeof(struct kpm_noirq_ctx),
+	.maxactive = 128,
+};
+
+/* ─── Post-NoIRQ Phase Marker Tracer (KPMPHASE) ────────────────────────────
+ *
+ * v11.5 field data proved the noirq phase fully completes (ramoops tail has
+ * "KPMNOIRQ: exit dev=platform drv=(none) rc=0" at the very end).  The real
+ * hang therefore sits in one of the post-noirq stages:
+ *
+ *   dpm_suspend_noirq() returns  ← confirmed reached via KPMNOIRQ tracer
+ *       platform_suspend_prepare_noirq(state)
+ *       s2idle_loop() [for PM_SUSPEND_TO_IDLE]
+ *         or
+ *       suspend_disable_secondary_cpus()
+ *       syscore_suspend()
+ *       arch_suspend_disable_irqs()
+ *       s2idle_enter() / suspend_ops->enter() / psci_cpu_suspend_enter()
+ *
+ * Hook a small, high-signal kretprobe on each of these — the LAST
+ * "KPMPHASE: enter <fn>" with no matching "KPMPHASE: exit <fn>" in ramoops
+ * after a fresh watchdog reboot is the function holding the thread when
+ * the CPU goes dark.  All handlers are guarded by kpm_suspend_trace_enabled
+ * so users can flip the tracer on/off without reloading the module.
+ */
+
+struct kpm_phase_ctx {
+	const char *name;
+};
+
+static atomic_t kpm_phase_trace_hits = ATOMIC_INIT(0);
+
+#define KPM_PHASE_ENTRY(_fn)						\
+static int __nocfi kpm_phase_ent_##_fn(struct kretprobe_instance *ri,	\
+				       struct pt_regs *regs)		\
+{									\
+	struct kpm_phase_ctx *ctx = (struct kpm_phase_ctx *)ri->data;	\
+	if (!READ_ONCE(kpm_suspend_trace_enabled)) {			\
+		ctx->name = NULL;					\
+		return 1;						\
+	}								\
+	ctx->name = #_fn;						\
+	atomic_inc(&kpm_phase_trace_hits);				\
+	pr_emerg("KPMPHASE: enter %s\n", ctx->name);			\
+	return 0;							\
+}
+
+#define KPM_PHASE_EXIT(_fn)						\
+static int __nocfi kpm_phase_ret_##_fn(struct kretprobe_instance *ri,	\
+				       struct pt_regs *regs)		\
+{									\
+	struct kpm_phase_ctx *ctx = (struct kpm_phase_ctx *)ri->data;	\
+	int rc = (int)regs->regs[0];					\
+	if (READ_ONCE(kpm_suspend_trace_enabled) && ctx->name)		\
+		pr_emerg("KPMPHASE: exit  %s rc=%d\n", ctx->name, rc);	\
+	return 0;							\
+}
+
+#define KPM_PHASE_KRP(_fn)						\
+	KPM_PHASE_ENTRY(_fn)						\
+	KPM_PHASE_EXIT(_fn)						\
+	static struct kretprobe kpm_phase_krp_##_fn = {			\
+		.kp.symbol_name = #_fn,					\
+		.entry_handler = kpm_phase_ent_##_fn,			\
+		.handler = kpm_phase_ret_##_fn,				\
+		.data_size = sizeof(struct kpm_phase_ctx),		\
+		.maxactive = 4,						\
+	}
+
+KPM_PHASE_KRP(dpm_suspend_noirq);
+KPM_PHASE_KRP(syscore_suspend);
+KPM_PHASE_KRP(freeze_secondary_cpus);
+KPM_PHASE_KRP(cpuidle_enter_s2idle);
+KPM_PHASE_KRP(cpuidle_enter_state);
+KPM_PHASE_KRP(psci_cpu_suspend_enter);
+KPM_PHASE_KRP(psci_system_suspend_enter);
+KPM_PHASE_KRP(cpu_suspend);
+KPM_PHASE_KRP(pm_suspend_default_s2idle);
+
+static struct kretprobe *kpm_phase_krp_list[] = {
+	&kpm_phase_krp_dpm_suspend_noirq,
+	&kpm_phase_krp_syscore_suspend,
+	&kpm_phase_krp_freeze_secondary_cpus,
+	&kpm_phase_krp_cpuidle_enter_s2idle,
+	&kpm_phase_krp_cpuidle_enter_state,
+	&kpm_phase_krp_psci_cpu_suspend_enter,
+	&kpm_phase_krp_psci_system_suspend_enter,
+	&kpm_phase_krp_cpu_suspend,
+	&kpm_phase_krp_pm_suspend_default_s2idle,
+};
+
 #define KPM_OC_DEFINE_NOIRQ_SHIELD(sym)						\
 	static struct kprobe kpm_noirq_kp_##sym = {				\
 		.symbol_name = #sym,						\
@@ -3650,28 +4190,17 @@ static int __nocfi kpm_noirq_shield_handler(struct kprobe *p,
 
 /* Primary crash gateway: ccci_dpmaif drv3 noirq. */
 KPM_OC_DEFINE_NOIRQ_SHIELD(drv3_suspend_noirq);
-/* Same module (ccci_dpmaif); shielded together so a future SoC variant
- * that takes the dpmaif path directly is still covered.
+/* Keep the shield at the narrowest point only (drv3). Wider modem-adjacent
+ * hooks (dpmaif/ccif/ccci_modem) may perturb suspend ordering on this build.
  */
-KPM_OC_DEFINE_NOIRQ_SHIELD(dpmaif_suspend_noirq);
-/* ccci_ccif noirq — adjacent CCCI IP that can trip the same AXI hang. */
-KPM_OC_DEFINE_NOIRQ_SHIELD(ccif_suspend_noirq);
-/* Top-level modem suspend hook (ccci_md_all). */
-KPM_OC_DEFINE_NOIRQ_SHIELD(ccci_modem_suspend);
-/* SCP suspend callback — last message before the noirq crash in some
- * ramoops captures, so shield it too.
- */
-KPM_OC_DEFINE_NOIRQ_SHIELD(scp_suspend_cb);
-/* MMInfra noirq — also implicated in the earlier v12 reboot logs. */
-KPM_OC_DEFINE_NOIRQ_SHIELD(mminfra_pm_suspend_noirq);
-
 static struct kprobe *kpm_noirq_shield_kprobes[] = {
 	&kpm_noirq_kp_drv3_suspend_noirq,
-	&kpm_noirq_kp_dpmaif_suspend_noirq,
-	&kpm_noirq_kp_ccif_suspend_noirq,
-	&kpm_noirq_kp_ccci_modem_suspend,
-	&kpm_noirq_kp_scp_suspend_cb,
-	&kpm_noirq_kp_mminfra_pm_suspend_noirq,
+	/* Keep shield scope minimal: only drv3 noirq callback. */
+};
+
+static struct kprobe kpm_dpm_run_kp = {
+	.symbol_name = "dpm_run_callback",
+	.pre_handler = kpm_dpm_run_cb_shield,
 };
 
 static int kpm_noirq_shield_register(void)
@@ -3693,6 +4222,76 @@ static int kpm_noirq_shield_register(void)
 		}
 		ok++;
 	}
+	{
+		int rc = register_kprobe(&kpm_dpm_run_kp);
+		if (rc < 0) {
+			pr_warn("KPM_OC: dpm shield kprobe register failed (%d)\n", rc);
+			kpm_dpm_run_kp.addr = NULL;
+		} else {
+			ok++;
+		}
+	}
+
+	/* Tracer kretprobe on dpm_run_callback.  Always armed; activity is
+	 * gated on kpm_suspend_trace_enabled so users can flip it on at any
+	 * time without reloading the module.
+	 */
+	{
+		int rc = register_kretprobe(&kpm_dpm_run_krp);
+
+		if (rc < 0) {
+			pr_warn("KPM_OC: suspend tracer kretprobe register failed (%d)\n",
+				rc);
+			kpm_dpm_run_krp.kp.addr = NULL;
+		} else {
+			pr_info("KPM_OC: suspend tracer kretprobe armed (dormant until suspend_trace_enabled=Y)\n");
+		}
+	}
+
+	/* Per-device noirq tracer kretprobe on __device_suspend_noirq.  This
+	 * fires for EVERY device entering the noirq phase, regardless of
+	 * whether the device has a noirq callback registered, giving us the
+	 * precise sequence the PM core walks during the hang window.
+	 */
+	{
+		int rc = register_kretprobe(&kpm_dev_susp_noirq_krp);
+
+		if (rc < 0) {
+			pr_warn("KPM_OC: noirq tracer kretprobe register failed (%d)\n",
+				rc);
+			kpm_dev_susp_noirq_krp.kp.addr = NULL;
+		} else {
+			pr_info("KPM_OC: noirq tracer kretprobe armed (__device_suspend_noirq)\n");
+		}
+	}
+
+	/* Post-noirq KPMPHASE tracer.  Registers a kretprobe on each of the
+	 * high-signal stages walked after dpm_suspend_noirq completes so we
+	 * can pinpoint which stage owns the hang window (the last "enter"
+	 * without a matching "exit" in ramoops is the culprit).  Failures to
+	 * register individual probes are non-fatal — some symbols (e.g.
+	 * s2idle_loop) are only present when suspend-to-idle is compiled in,
+	 * but they all exist on this kernel per kallsyms inspection.
+	 */
+	{
+		int i;
+		int ok_cnt = 0;
+
+		for (i = 0; i < ARRAY_SIZE(kpm_phase_krp_list); i++) {
+			struct kretprobe *krp = kpm_phase_krp_list[i];
+			int rc = register_kretprobe(krp);
+
+			if (rc < 0) {
+				pr_warn("KPM_OC: KPMPHASE krp %s register failed (%d)\n",
+					krp->kp.symbol_name, rc);
+				krp->kp.addr = NULL;
+			} else {
+				ok_cnt++;
+			}
+		}
+		pr_info("KPM_OC: KPMPHASE tracer armed (%d/%zu probes)\n",
+			ok_cnt, ARRAY_SIZE(kpm_phase_krp_list));
+	}
 
 	pr_info("KPM_OC: noirq shield armed (%d/%zu probes, enabled=%d)\n",
 		ok, ARRAY_SIZE(kpm_noirq_shield_kprobes),
@@ -3710,8 +4309,112 @@ static void kpm_noirq_shield_unregister(void)
 		if (kp->addr)
 			unregister_kprobe(kp);
 	}
-	pr_info("KPM_OC: noirq shield disarmed (total hits: %d)\n",
-		atomic_read(&kpm_noirq_shield_hits));
+	if (kpm_dpm_run_kp.addr)
+		unregister_kprobe(&kpm_dpm_run_kp);
+	if (kpm_dpm_run_krp.kp.addr)
+		unregister_kretprobe(&kpm_dpm_run_krp);
+	if (kpm_dev_susp_noirq_krp.kp.addr)
+		unregister_kretprobe(&kpm_dev_susp_noirq_krp);
+	{
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(kpm_phase_krp_list); i++) {
+			struct kretprobe *krp = kpm_phase_krp_list[i];
+
+			if (krp->kp.addr)
+				unregister_kretprobe(krp);
+		}
+	}
+	pr_info("KPM_OC: noirq shield disarmed (total hits: %d, trace hits: %d, noirq hits: %d, phase hits: %d)\n",
+		atomic_read(&kpm_noirq_shield_hits),
+		atomic_read(&kpm_suspend_trace_hits),
+		atomic_read(&kpm_noirq_trace_hits),
+		atomic_read(&kpm_phase_trace_hits));
+}
+
+/* ─── Suspend Return Safety-Net (kretprobe) ───────────────────────────────
+ *
+ * Some vendor suspend callbacks intermittently return transient failures
+ * (-EIO / -ETIMEDOUT) during late/noirq phases on this platform.  The failure
+ * can leave parts of the suspend pipeline in a half-transitioned state, after
+ * which watchdog firmware triggers a silent reset instead of a clean abort.
+ *
+ * Preserve the old kpm_fix safety-net here: coerce known noisy callbacks to
+ * success on return so PM flow remains consistent.
+ */
+static atomic_t kpm_suspend_retfix_hits = ATOMIC_INIT(0);
+
+static int __nocfi kpm_suspend_retfix_handler(struct kretprobe_instance *ri,
+					      struct pt_regs *regs)
+{
+	int ret = (int)regs->regs[0];
+
+	if (!READ_ONCE(kpm_noirq_shield_enabled))
+		return 0;
+	if (!atomic_read(&kpm_suspended))
+		return 0;
+
+	if (ret != 0) {
+		regs->regs[0] = 0;
+		if (atomic_inc_return(&kpm_suspend_retfix_hits) <= 64)
+			pr_info("KPM_OC: suspend retfix ret=%d->0\n", ret);
+	}
+	return 0;
+}
+
+#define KPM_OC_DEFINE_SUSP_RET_FIX(sym)					\
+	static struct kretprobe kpm_retfix_##sym = {			\
+		.kp.symbol_name = #sym,					\
+		.handler = kpm_suspend_retfix_handler,			\
+		.maxactive = 512,					\
+	}
+
+KPM_OC_DEFINE_SUSP_RET_FIX(mt6375_auxadc_suspend_late);
+KPM_OC_DEFINE_SUSP_RET_FIX(mmc_bus_suspend);
+KPM_OC_DEFINE_SUSP_RET_FIX(alarmtimer_suspend);
+KPM_OC_DEFINE_SUSP_RET_FIX(mtk_uarthub_suspend);
+
+static struct kretprobe *kpm_suspend_retfix_kretprobes[] = {
+	&kpm_retfix_mt6375_auxadc_suspend_late,
+	&kpm_retfix_mmc_bus_suspend,
+	&kpm_retfix_alarmtimer_suspend,
+	&kpm_retfix_mtk_uarthub_suspend,
+};
+
+static int kpm_suspend_retfix_register(void)
+{
+	int i, ok = 0;
+
+	for (i = 0; i < ARRAY_SIZE(kpm_suspend_retfix_kretprobes); i++) {
+		struct kretprobe *krp = kpm_suspend_retfix_kretprobes[i];
+		int rc = register_kretprobe(krp);
+
+		if (rc < 0) {
+			pr_warn("KPM_OC: suspend retfix kretprobe [%s] register failed (%d)\n",
+				krp->kp.symbol_name, rc);
+			krp->kp.addr = NULL;
+			continue;
+		}
+		ok++;
+	}
+
+	pr_info("KPM_OC: suspend retfix armed (%d/%zu probes)\n",
+		ok, ARRAY_SIZE(kpm_suspend_retfix_kretprobes));
+	return ok;
+}
+
+static void kpm_suspend_retfix_unregister(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(kpm_suspend_retfix_kretprobes); i++) {
+		struct kretprobe *krp = kpm_suspend_retfix_kretprobes[i];
+
+		if (krp->kp.addr)
+			unregister_kretprobe(krp);
+	}
+	pr_info("KPM_OC: suspend retfix disarmed (total fixes: %d)\n",
+		atomic_read(&kpm_suspend_retfix_hits));
 }
 
 /* ─── Module Init / Exit ────────────────────────────────────────────────── */
@@ -3765,9 +4468,10 @@ static int __init kpm_oc_init(void)
 	 * before the first user-triggered sleep after insmod.
 	 */
 	kpm_noirq_shield_register();
+	kpm_suspend_retfix_register();
 
-	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v8.2 (base=0x%lx)\n",
-		CSRAM_PHYS_BASE);
+	pr_info("KPM_OC: MT8792 CSRAM OPP reader + CPU/GPU OC v11.2 (base=0x%lx, dpm_shield=%d)\n",
+		CSRAM_PHYS_BASE, kpm_dpm_shield_enabled);
 
 	/* Register kprobes for freq_qos and userlimit interception */
 	{
@@ -3894,12 +4598,15 @@ static int __init kpm_oc_init(void)
 	/* Auto-scan CPU OPP on load */
 	set_apply("1", NULL);
 
-	/* Auto-apply CPU OC if any cluster target is set */
-	if (cpu_oc_l_freq || cpu_oc_b_freq || cpu_oc_p_freq)
+	/* Auto-apply CPU OC only when explicitly requested */
+	if (cpu_auto_apply && (cpu_oc_l_freq || cpu_oc_b_freq || cpu_oc_p_freq))
 		set_cpu_oc("1", NULL);
 
-	/* Auto-apply GPU OC: always patches default OPP; working+shared if already probed */
-	set_gpu_oc("1", NULL);
+	/* Auto-apply GPU patch only when explicitly requested or above-stock target
+	 * is configured. This reduces runtime instability in stock-use scenarios.
+	 */
+	if (gpu_auto_apply)
+		set_gpu_oc("1", NULL);
 
 	/*
 	 * Start GPU relift kthread for module lifetime so runtime table refreshes
@@ -3924,6 +4631,7 @@ static void __exit kpm_oc_exit(void)
 {
 	unregister_pm_notifier(&kpm_oc_pm_nb);
 	kpm_noirq_shield_unregister();
+	kpm_suspend_retfix_unregister();
 	unregister_kprobe(&freq_qos_kp);
 	unregister_kprobe(&userlimit_kp);
 	unregister_kprobe(&scmi_fast_switch_kp);
@@ -3958,4 +4666,4 @@ module_init(kpm_oc_init);
 module_exit(kpm_oc_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zerofrip");
-MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass + noirq shield v8.2");
+MODULE_DESCRIPTION("MT8792 CSRAM CPU OPP reader + CPU/GPU OC patcher + PLL bypass + noirq shield v11.2");
