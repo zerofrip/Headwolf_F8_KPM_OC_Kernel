@@ -7,7 +7,11 @@
 #     Download: https://gitlab.com/ThankYouMario/android_prebuilts_clang-standalone (r487747c tag)
 #              or extract from an AOSP build mirror.
 #
-# Kernel source preparation (one-time):
+# Kernel source preparation for a connected Headwolf F8 (recommended):
+#   ./prepare_device_kernel.sh KERNEL_DIR=<path> CLANG_DIR=<path>
+#   (pulls /proc/config.gz, matches uname -r, builds Module.symvers)
+#
+# Generic one-time prep (wrong vermagic if SUBLEVEL/localversion differ):
 #   cd <KERNEL_DIR>
 #   PATH=<CLANG_DIR>/bin:$PATH \
 #   make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
@@ -50,8 +54,15 @@ if [[ ! -f "$KERNEL_DIR/Makefile" ]]; then
     exit 1
 fi
 if [[ ! -f "$KERNEL_DIR/scripts/mod/modpost" ]]; then
-    echo "ERROR: Kernel source is not prepared. Run 'make ... modules_prepare' first."
+    echo "ERROR: Kernel source is not prepared. Run prepare_device_kernel.sh first."
     echo "  See comments at the top of this script for instructions."
+    exit 1
+fi
+
+if [[ ! -f "$KERNEL_DIR/Module.symvers" ]]; then
+    echo "ERROR: Module.symvers not found in KERNEL_DIR."
+    echo "  Run ./prepare_device_kernel.sh KERNEL_DIR=$KERNEL_DIR to build it."
+    echo "  Without symvers, insmod may kernel-panic on mod_sysfs_setup."
     exit 1
 fi
 
@@ -77,7 +88,23 @@ if ! echo "$CLANG_VER" | grep -qE "clang version 17\."; then
     echo "WARNING: Expected Android clang 17.0.x (r487747c). CFI failures may occur at insmod."
 fi
 
+# Sync UTS_RELEASE for external module vermagic (kernel.release may differ from utsrelease.h)
+if [[ -f "$KERNEL_DIR/include/config/kernel.release" ]]; then
+    KREL_FILE=$(tr -d '\n' < "$KERNEL_DIR/include/config/kernel.release")
+    if [[ -n "$KREL_FILE" ]]; then
+        mkdir -p "$KERNEL_DIR/include/generated"
+        echo "#define UTS_RELEASE \"${KREL_FILE}\"" > "$KERNEL_DIR/include/generated/utsrelease.h"
+    fi
+fi
+
 KVER=$(make -s -C "$KERNEL_DIR" ARCH=arm64 LLVM=1 kernelrelease 2>/dev/null || true)
+if [[ -f "$KERNEL_DIR/include/config/kernel.release" ]]; then
+    KVER=$(tr -d '\n' < "$KERNEL_DIR/include/config/kernel.release")
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"${ROOT}/patch_kernel_autoconf.sh" KERNEL_DIR="${KERNEL_DIR}"
+
 echo "Kernel: $KVER"
 echo "Module source: $(pwd)"
 echo ""
@@ -94,10 +121,15 @@ make \
 
 # ── Result ───────────────────────────────────────────────────────────────────
 if [[ -f kpm_oc.ko ]]; then
+    if command -v llvm-objcopy >/dev/null 2>&1; then
+        llvm-objcopy --strip-debug kpm_oc.ko kpm_oc.ko.stripped
+        mv kpm_oc.ko.stripped kpm_oc.ko
+    fi
     echo ""
     echo "Build succeeded:"
     ls -lh kpm_oc.ko
     echo "vermagic: $(strings kpm_oc.ko | grep '^vermagic=')"
+    llvm-readelf -S kpm_oc.ko 2>/dev/null | grep 'this_module' || true
 else
     echo "ERROR: kpm_oc.ko not found after build."
     exit 1

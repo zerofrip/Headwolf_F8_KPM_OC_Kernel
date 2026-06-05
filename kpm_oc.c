@@ -130,7 +130,7 @@
  *   v11.6: Add KPMPHASE tracer for the post-noirq suspend pipeline.
  *          v11.5 field data proved the whole suspend_noirq phase (including
  *          the final "platform" pseudo-device) completes cleanly before the
- *          hang — the watchdog fires during one of the subsequent stages
+ *          hang - the watchdog fires during one of the subsequent stages
  *          (platform_suspend_prepare_noirq / s2idle_loop / s2idle_enter /
  *          syscore_suspend / psci_cpu_suspend_enter / cpu_suspend).  The
  *          new tracer hooks each of those with a single-line "KPMPHASE:
@@ -160,7 +160,7 @@
  *          "KPMNOIRQ: enter" with no matching "KPMNOIRQ: exit" in
  *          console-ramoops after a sleep reboot is the hanging device.
  *
- * Driver: mtk-cpufreq-hw — LUT bits[11:0] = freq_MHz.
+ * Driver: mtk-cpufreq-hw - LUT bits[11:0] = freq_MHz.
  * Kernel 6.1 GKI compatible.
  */
 #include <linux/module.h>
@@ -221,7 +221,7 @@ static const char * const cluster_names[] = { "L", "B", "P" };
  * This section directly programs ARMPLL PCW (phase-controlled word) registers
  * to achieve real hardware overclocking.
  *
- * From DTB fhctl node — MCU PLL subsystem at 0x0C030000:
+ * From DTB fhctl node - MCU PLL subsystem at 0x0C030000:
  *   ccipll:    base+0x000, FHCTL base+0x100
  *   armpll_ll: base+0x400, FHCTL base+0x500  (L cluster, policy0)
  *   armpll_bl: base+0x800, FHCTL base+0x900  (B cluster, policy4)
@@ -236,7 +236,7 @@ static const char * const cluster_names[] = { "L", "B", "P" };
  *   bits[26:24] = POSTDIV power (0=÷1, 1=÷2, 2=÷4, ...)
  *
  * WARNING: Direct PLL manipulation bypasses MCUPM DVFS.  Voltage is NOT
- * adjusted here — the CPU runs at whatever voltage MCUPM last set for the
+ * adjusted here - the CPU runs at whatever voltage MCUPM last set for the
  * stock frequency.  Overclocking without voltage increase risks instability.
  */
 #define MCU_PLL_PHYS_BASE    0x0C030000UL
@@ -284,8 +284,8 @@ static const unsigned int pll_offsets[] = { 0x400, 0x800, 0xC00 }; /* L, B, P */
 /* LUT entry format (mtk-cpufreq-hw on MT6897):
  *   bits[11:0]  = frequency in MHz
  *   bits[30:29] = gear selector (voltage domain switch)
- *   remaining upper bits >> 12 (with bits 30:29 cleared) = voltage in 10 µV units
- *   Voltage (µV) = ((raw & 0x9FFFFFFF) >> 12) * 10
+ *   remaining upper bits >> 12 (with bits 30:29 cleared) = voltage in 10 uV units
+ *   Voltage (uV) = ((raw & 0x9FFFFFFF) >> 12) * 10
  */
 #define LUT_FREQ_MASK     0x00000FFFU
 #define LUT_GEAR_MASK     0x60000000U
@@ -485,7 +485,7 @@ static int get_opp_table(char *buf, const struct kernel_param *kp)
 static const struct kernel_param_ops opp_table_ops = { .get = get_opp_table };
 static int opp_table_dummy;
 module_param_cb(opp_table, &opp_table_ops, &opp_table_dummy, 0444);
-MODULE_PARM_DESC(opp_table, "CPU OPP table (CPU:policy:freq_khz:volt_uv|...) — live CSRAM read");
+MODULE_PARM_DESC(opp_table, "CPU OPP table (CPU:policy:freq_khz:volt_uv|...) - live CSRAM read");
 
 static int get_raw_dump(char *buf, const struct kernel_param *kp)
 {
@@ -501,7 +501,7 @@ static int get_raw_dump(char *buf, const struct kernel_param *kp)
 static const struct kernel_param_ops raw_dump_ops = { .get = get_raw_dump };
 static int raw_dump_dummy;
 module_param_cb(raw, &raw_dump_ops, &raw_dump_dummy, 0444);
-MODULE_PARM_DESC(raw, "Raw hex dump of LUT entries — live CSRAM read");
+MODULE_PARM_DESC(raw, "Raw hex dump of LUT entries - live CSRAM read");
 
 /* ─── Scan CSRAM and Export CPU Freq Table ──────────────────────────────── */
 
@@ -544,7 +544,7 @@ static int set_apply(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops apply_ops = { .set = set_apply };
 static int apply_dummy;
-module_param_cb(apply, &apply_ops, &apply_dummy, 0220);
+module_param_cb(apply, &apply_ops, &apply_dummy, 0644);
 MODULE_PARM_DESC(apply, "Write 1 to scan CSRAM and export CPU OPP table");
 
 /* ─── kallsyms utility (shared by CPU OC + GPU OC) ─────────────────────── */
@@ -574,7 +574,7 @@ static int resolve_kallsyms(void)
 	return 0;
 }
 
-/* cpufreq function pointers — resolved at runtime via kallsyms to avoid
+/* cpufreq function pointers - resolved at runtime via kallsyms to avoid
  * hard symbol dependencies that can prevent module loading at early boot.
  */
 typedef struct cpufreq_policy *(*cpufreq_cpu_get_t)(unsigned int cpu);
@@ -584,7 +584,7 @@ static cpufreq_cpu_get_t fn_cpufreq_cpu_get;
 static cpufreq_cpu_put_t fn_cpufreq_cpu_put;
 
 /*
- * Vendor freq_qos constraint updaters — resolved via kallsyms.
+ * Vendor freq_qos constraint updaters - resolved via kallsyms.
  *
  * powerhal_cpu_ctrl + touch_boost share a FREQ_QOS_MAX constraint per cluster
  * via a global freq_max_request[], initialised to the stock max frequency.
@@ -615,28 +615,32 @@ static unsigned long           pt_policy_list_sym; /* mtk_cpu_power_throttling l
 #define CPU_PT_NODE_TO_REQ_OFF 0x48
 #define CPU_PT_NODE_TO_FLAG_OFF 0x60
 
-/* Periodic relift worker — re-lifts vendor freq_qos MAX constraints that
+/* Periodic relift worker - re-lifts vendor freq_qos MAX constraints that
  * get re-asserted by powerhal, fpsgo, battery throttling, etc.
  */
 #define RELIFT_INTERVAL_MS 500
 static struct delayed_work cpu_oc_relift_dwork;
 static bool cpu_oc_relift_active;
 static unsigned int cpu_oc_targets[NUM_CLUSTERS]; /* per-cluster OC target KHz, 0=off */
-/* Saved stock CSRAM LUT[0] raw values — restored before suspend so MCUPM
+/* Saved stock CSRAM LUT[0] raw values - restored before suspend so MCUPM
  * does not attempt DDS calculation on the OC'd frequency during deep sleep.
  */
 static u32 cpu_oc_orig_lut0[NUM_CLUSTERS];
 /* Cached &policy->constraints per cluster for kprobe interception */
 static struct freq_constraints *cluster_qos_ptr[NUM_CLUSTERS];
 
+/* CPU per-LUT overrides (CSRAM direct). Defined here for relift/MCUPM paths. */
+static unsigned int cpu_volt_ov[NUM_CLUSTERS][LUT_MAX_ENTRIES];
+static int          cpu_volt_ov_count;
+static unsigned int cpu_orig_volt[NUM_CLUSTERS][LUT_MAX_ENTRIES];
+static unsigned int cpu_freq_ov[NUM_CLUSTERS][LUT_MAX_ENTRIES];
+static unsigned int cpu_orig_freq_khz[NUM_CLUSTERS][LUT_MAX_ENTRIES];
+static int          cpu_freq_ov_count;
+
 static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work);
 
 /* ─── PLL Direct Access state (read-only diagnostics) ─── */
 static void __iomem *mcu_pll_base;
-
-/* Forward declarations for CPU voltage override (defined after GPU section) */
-static unsigned int cpu_volt_ov[NUM_CLUSTERS][LUT_MAX_ENTRIES];
-static int          cpu_volt_ov_count;
 
 static void __nocfi resolve_cpufreq_symbols(void)
 {
@@ -667,7 +671,7 @@ static void __nocfi resolve_cpufreq_symbols(void)
 /*
  * For each cluster (L/B/P), if cpu_oc_X_freq is set to a nonzero value:
  *   1. Patches CSRAM LUT[0] (the hardware performance-controller table) with
- *      the new freq (MHz) and volt (µV), keeping the original gear selector
+ *      the new freq (MHz) and volt (uV), keeping the original gear selector
  *      bits [30:29]. Encoding: bits[11:0]=freq_MHz, bits[28:12]=volt_uv/10.
  *   2. Updates the Linux cpufreq policy (freq_table max entry, policy->max,
  *      cpuinfo.max_freq) so the governor can schedule the new maximum.
@@ -680,7 +684,7 @@ MODULE_PARM_DESC(cpu_oc_l_freq, "L cluster (policy0) OC target in KHz (0=disable
 
 static unsigned int cpu_oc_l_volt;
 module_param(cpu_oc_l_volt, uint, 0644);
-MODULE_PARM_DESC(cpu_oc_l_volt, "L cluster OC volt in µV (0=keep original)");
+MODULE_PARM_DESC(cpu_oc_l_volt, "L cluster OC volt in uV (0=keep original)");
 
 static unsigned int cpu_oc_b_freq;
 module_param(cpu_oc_b_freq, uint, 0644);
@@ -688,7 +692,7 @@ MODULE_PARM_DESC(cpu_oc_b_freq, "B cluster (policy4) OC target in KHz (0=disable
 
 static unsigned int cpu_oc_b_volt;
 module_param(cpu_oc_b_volt, uint, 0644);
-MODULE_PARM_DESC(cpu_oc_b_volt, "B cluster OC volt in µV (0=keep original)");
+MODULE_PARM_DESC(cpu_oc_b_volt, "B cluster OC volt in uV (0=keep original)");
 
 static unsigned int cpu_oc_p_freq;
 module_param(cpu_oc_p_freq, uint, 0644);
@@ -696,7 +700,7 @@ MODULE_PARM_DESC(cpu_oc_p_freq, "P cluster (policy7) OC target in KHz (0=disable
 
 static unsigned int cpu_oc_p_volt;
 module_param(cpu_oc_p_volt, uint, 0644);
-MODULE_PARM_DESC(cpu_oc_p_volt, "P cluster OC volt in µV (0=keep original)");
+MODULE_PARM_DESC(cpu_oc_p_volt, "P cluster OC volt in uV (0=keep original)");
 
 static bool cpu_auto_apply;
 module_param(cpu_auto_apply, bool, 0644);
@@ -796,7 +800,7 @@ static int set_pll_dump(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops pll_dump_ops = { .set = set_pll_dump };
 static int pll_dump_dummy;
-module_param_cb(pll_scan, &pll_dump_ops, &pll_dump_dummy, 0220);
+module_param_cb(pll_scan, &pll_dump_ops, &pll_dump_dummy, 0644);
 MODULE_PARM_DESC(pll_scan, "Write 1 to dump PLL registers");
 
 /* ─── CSRAM perf_state diagnostic ───────────────────────────────────────── */
@@ -857,7 +861,7 @@ static int set_perf_diag(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops perf_diag_ops = { .set = set_perf_diag };
 static int perf_diag_dummy;
-module_param_cb(perf_scan, &perf_diag_ops, &perf_diag_dummy, 0220);
+module_param_cb(perf_scan, &perf_diag_ops, &perf_diag_dummy, 0644);
 MODULE_PARM_DESC(perf_scan, "Write 1 to dump CSRAM perf_state diagnostics");
 
 /* ─── MCUPM SRAM Frequency Table Scanner ────────────────────────────────── */
@@ -1037,7 +1041,7 @@ static int set_mcupm_scan(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops mcupm_scan_ops = { .set = set_mcupm_scan };
 static int mcupm_scan_dummy;
-module_param_cb(mcupm_scan_trigger, &mcupm_scan_ops, &mcupm_scan_dummy, 0220);
+module_param_cb(mcupm_scan_trigger, &mcupm_scan_ops, &mcupm_scan_dummy, 0644);
 MODULE_PARM_DESC(mcupm_scan_trigger, "Write 1 to scan MCUPM SRAM for freq tables");
 
 /* Hexdump a region of MCUPM DRAM: write "offset" to trigger,
@@ -1096,7 +1100,7 @@ static int set_mcupm_hexdump(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops mcupm_hex_ops = { .set = set_mcupm_hexdump };
 static int mcupm_hex_dummy;
-module_param_cb(mcupm_hexdump, &mcupm_hex_ops, &mcupm_hex_dummy, 0220);
+module_param_cb(mcupm_hexdump, &mcupm_hex_ops, &mcupm_hex_dummy, 0644);
 MODULE_PARM_DESC(mcupm_hexdump, "Hex dump MCUPM memory: write offset, read mcupm_hex");
 
 /* MCUPM DRAM write: "offset,value_hex" (offset within DRAM region) */
@@ -1147,7 +1151,7 @@ static int set_mcupm_write(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops mcupm_write_ops = { .set = set_mcupm_write };
 static int mcupm_write_dummy;
-module_param_cb(mcupm_dram_write, &mcupm_write_ops, &mcupm_write_dummy, 0220);
+module_param_cb(mcupm_dram_write, &mcupm_write_ops, &mcupm_write_dummy, 0644);
 MODULE_PARM_DESC(mcupm_dram_write, "Write DRAM: offset,value_hex");
 
 /* ─── Kernel virtual memory reader ──────────────────────────────────────── */
@@ -1196,7 +1200,7 @@ static int set_kvm_read(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops kvm_read_ops = { .set = set_kvm_read };
 static int kvm_read_dummy;
-module_param_cb(kvm_read_trigger, &kvm_read_ops, &kvm_read_dummy, 0220);
+module_param_cb(kvm_read_trigger, &kvm_read_ops, &kvm_read_dummy, 0644);
 MODULE_PARM_DESC(kvm_read_trigger, "Read 256 bytes at kernel virtual address");
 
 /* ─── fhctl hopping function caller ─────────────────────────────────────── */
@@ -1289,7 +1293,7 @@ static int set_fhctl_diag(const char *val, const struct kernel_param *kp)
 			fn_mcupm_hopping, fn_ap_hopping, (void *)fhctl_array_sym);
 
 	/*
-	 * _array is a POINTER variable in fhctl BSS — dereference once
+	 * _array is a POINTER variable in fhctl BSS - dereference once
 	 * to get the actual array base.  Each per-PLL struct is 80 bytes
 	 * (10 qwords).  14 PLLs total (from ctrl output).
 	 */
@@ -1338,7 +1342,7 @@ static int set_fhctl_diag(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops fhctl_diag_ops = { .set = set_fhctl_diag };
 static int fhctl_diag_dummy;
-module_param_cb(fhctl_scan, &fhctl_diag_ops, &fhctl_diag_dummy, 0220);
+module_param_cb(fhctl_scan, &fhctl_diag_ops, &fhctl_diag_dummy, 0644);
 MODULE_PARM_DESC(fhctl_scan, "Write 1 to dump fhctl internal state");
 
 /* ─── mcupm_hopping_v1 direct caller ─────────────────────────────────────
@@ -1515,7 +1519,7 @@ static int __nocfi set_mcupm_hop(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops mcupm_hop_ops = { .set = set_mcupm_hop };
 static int mcupm_hop_dummy;
-module_param_cb(mcupm_hop, &mcupm_hop_ops, &mcupm_hop_dummy, 0220);
+module_param_cb(mcupm_hop, &mcupm_hop_ops, &mcupm_hop_dummy, 0644);
 MODULE_PARM_DESC(mcupm_hop, "Call mcupm_hopping_v1: array_idx,fh_id,dds[,postdiv]");
 
 /* ─── CPU OC via CSRAM LUT[0] patch + cpufreq policy update ─────────────── */
@@ -1582,7 +1586,7 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 
 		/*
 		 * Encode new LUT entry:
-		 *   bits[30:29] = gear selector — keep from original
+		 *   bits[30:29] = gear selector - keep from original
 		 *   bits[28:12] = volt_uv / 10
 		 *   bits[11:0]  = freq_MHz
 		 */
@@ -1593,7 +1597,7 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 		writel_relaxed(new_lut, csram_base + dom_base + REG_FREQ_LUT);
 		wmb();
 
-		pr_info("KPM_OC: CPU %s LUT[0]: %uMHz@%uµV -> %uMHz@%uµV (0x%08x->0x%08x)\n",
+		pr_info("KPM_OC: CPU %s LUT[0]: %uMHz@%uuV -> %uMHz@%uuV (0x%08x->0x%08x)\n",
 			cluster_names[c], orig_freq_mhz, orig_volt_uv,
 			new_freq_mhz, target_uv, orig_lut, new_lut);
 
@@ -1616,7 +1620,7 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 				struct cpufreq_frequency_table *tbl = policy->freq_table;
 				if (tbl) {
 					/*
-					 * Always update index 0 — it corresponds to
+					 * Always update index 0 - it corresponds to
 					 * LUT[0] (the highest OPP in descending LUT).
 					 * Previous code searched for max freq entry,
 					 * which broke on re-OC after underclocking
@@ -1744,7 +1748,7 @@ static int __nocfi set_cpu_oc(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops cpu_oc_ops = { .set = set_cpu_oc };
 static int cpu_oc_dummy;
-module_param_cb(cpu_oc_apply, &cpu_oc_ops, &cpu_oc_dummy, 0220);
+module_param_cb(cpu_oc_apply, &cpu_oc_ops, &cpu_oc_dummy, 0644);
 MODULE_PARM_DESC(cpu_oc_apply, "Write 1 to patch CPU CSRAM LUT[0] + cpufreq policy max");
 
 /* ─── kprobe: zero-latency freq_qos_update_request intercept ────────────── */
@@ -1839,7 +1843,7 @@ static struct kprobe userlimit_kp = {
  * (freq bits[11:0] are preserved, but bits[28:12] = voltage are replaced).
  *
  * Fix: Kprobe on scmi_cpufreq_fast_switch (the actual DVFS path on this SoC,
- * since it uses scmi_cpufreq driver — not mtk-cpufreq-hw).  In the
+ * since it uses scmi_cpufreq driver - not mtk-cpufreq-hw).  In the
  * pre-handler we re-write CSRAM LUT voltages and trigger PLL re-enforcement.
  */
 static void __nocfi cpu_csram_resync_fast(void)
@@ -1871,20 +1875,29 @@ static void __nocfi cpu_csram_resync_fast(void)
 			}
 		}
 
-		/* Re-patch per-LUT voltage overrides */
-		if (cpu_volt_ov_count > 0) {
+		/* Re-patch per-LUT frequency + voltage overrides */
+		if (cpu_volt_ov_count > 0 || cpu_freq_ov_count > 0) {
 			for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+				unsigned int freq_khz = cpu_freq_ov[c][i];
 				unsigned int ov = cpu_volt_ov[c][i];
 				u32 cur, patched;
+				unsigned int f_mhz;
 
-				if (!ov)
+				if (!freq_khz && !ov)
 					continue;
 
 				cur = readl_relaxed(csram_base + dom_base +
 						    REG_FREQ_LUT +
 						    i * LUT_ROW_SIZE);
-				patched = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
-					  ((ov / 10) << 12);
+				patched = cur;
+				if (freq_khz) {
+					f_mhz = freq_khz / 1000;
+					patched = (patched & ~LUT_FREQ_MASK) |
+						  (f_mhz & LUT_FREQ_MASK);
+				}
+				if (ov)
+					patched = (patched & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+						  ((ov / 10) << 12);
 				if (cur != patched)
 					writel_relaxed(patched, csram_base +
 						       dom_base + REG_FREQ_LUT +
@@ -1893,7 +1906,7 @@ static void __nocfi cpu_csram_resync_fast(void)
 		}
 	}
 
-	/* No wmb() — writel_relaxed ordering is sufficient; the HW read
+	/* No wmb() - writel_relaxed ordering is sufficient; the HW read
 	 * follows the REG_FREQ_PERF_STATE write which acts as a barrier.
 	 */
 }
@@ -2055,7 +2068,7 @@ static int set_scmi_override(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops scmi_ov_ops = { .set = set_scmi_override };
 static int scmi_ov_dummy;
-module_param_cb(scmi_override, &scmi_ov_ops, &scmi_ov_dummy, 0220);
+module_param_cb(scmi_override, &scmi_ov_ops, &scmi_ov_dummy, 0644);
 MODULE_PARM_DESC(scmi_override, "Override SCMI perf level: domain,level (0=clear)");
 
 /* ─── mcupm_hopping_v1 argument capture ─────────────────────────────────── */
@@ -2204,7 +2217,7 @@ static int set_fhctl_oc(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops fhctl_oc_ops = { .set = set_fhctl_oc };
 static int fhctl_oc_dummy;
-module_param_cb(fhctl_oc, &fhctl_oc_ops, &fhctl_oc_dummy, 0220);
+module_param_cb(fhctl_oc, &fhctl_oc_ops, &fhctl_oc_dummy, 0644);
 MODULE_PARM_DESC(fhctl_oc, "FHCTL IPI OC: write fh_id,dds_hex[,postdiv]");
 
 /* ─── fhctl has_perms patch ─────────────────────────────────────────────── */
@@ -2232,14 +2245,76 @@ static int set_fhctl_unlock(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops fhctl_unlock_ops = { .set = set_fhctl_unlock };
 static int fhctl_unlock_dummy;
-module_param_cb(fhctl_unlock, &fhctl_unlock_ops, &fhctl_unlock_dummy, 0220);
+module_param_cb(fhctl_unlock, &fhctl_unlock_ops, &fhctl_unlock_dummy, 0644);
 MODULE_PARM_DESC(fhctl_unlock, "Write 1 to unlock fhctl debugfs ctrl");
 
-static void cpu_reapply_volt_overrides_locked(void)
+static void cpu_sync_cpufreq_entry(unsigned int cl, unsigned int old_khz,
+				   unsigned int new_khz)
+{
+	struct cpufreq_policy *policy;
+	int i;
+
+	if (!old_khz || !new_khz || old_khz == new_khz || !fn_cpufreq_cpu_get)
+		return;
+
+	policy = fn_cpufreq_cpu_get(cluster_policies[cl]);
+	if (!policy || !policy->freq_table) {
+		if (policy && fn_cpufreq_cpu_put)
+			fn_cpufreq_cpu_put(policy);
+		return;
+	}
+
+	for (i = 0; policy->freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
+		if (policy->freq_table[i].frequency == old_khz) {
+			policy->freq_table[i].frequency = new_khz;
+			pr_info("KPM_OC: %s cpufreq tbl %u->%uKHz\n",
+				cluster_names[cl], old_khz, new_khz);
+			break;
+		}
+	}
+
+	if (fn_cpufreq_cpu_put)
+		fn_cpufreq_cpu_put(policy);
+}
+
+static int cpu_validate_lut_descending(unsigned int cl)
+{
+	unsigned int dom_base = domain_offsets[cl];
+	unsigned int prev_mhz = 0;
+	unsigned int seen[LUT_MAX_ENTRIES];
+	int seen_n = 0;
+	int i;
+
+	for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+		u32 lut = readl_relaxed(csram_base + dom_base +
+					REG_FREQ_LUT + i * LUT_ROW_SIZE);
+		unsigned int f_mhz = lut & LUT_FREQ_MASK;
+		int j;
+
+		if (f_mhz == 0)
+			break;
+
+		if (f_mhz < 100 || f_mhz > 5000)
+			return -EINVAL;
+		if (prev_mhz && f_mhz >= prev_mhz)
+			return -EINVAL;
+
+		for (j = 0; j < seen_n; j++)
+			if (seen[j] == f_mhz)
+				return -EINVAL;
+		seen[seen_n++] = f_mhz;
+		prev_mhz = f_mhz;
+	}
+	return 0;
+}
+
+static void cpu_reapply_lut_overrides_locked(void)
 {
 	int c;
 
-	if (cpu_volt_ov_count <= 0 || !csram_base)
+	if (!csram_base)
+		return;
+	if (cpu_volt_ov_count <= 0 && cpu_freq_ov_count <= 0)
 		return;
 
 	for (c = 0; c < NUM_CLUSTERS; c++) {
@@ -2247,16 +2322,25 @@ static void cpu_reapply_volt_overrides_locked(void)
 		int i;
 
 		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
-			unsigned int ov = cpu_volt_ov[c][i];
+			unsigned int freq_khz = cpu_freq_ov[c][i];
+			unsigned int volt_uv = cpu_volt_ov[c][i];
 			u32 cur, patched;
+			unsigned int f_mhz;
 
-			if (!ov)
+			if (!freq_khz && !volt_uv)
 				continue;
 
 			cur = readl_relaxed(csram_base + dom_base +
 					    REG_FREQ_LUT + i * LUT_ROW_SIZE);
-			patched = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
-				  ((ov / 10) << 12);
+			patched = cur;
+			if (freq_khz) {
+				f_mhz = freq_khz / 1000;
+				patched = (patched & ~LUT_FREQ_MASK) |
+					  (f_mhz & LUT_FREQ_MASK);
+			}
+			if (volt_uv)
+				patched = (patched & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+					  ((volt_uv / 10) << 12);
 			if (cur != patched)
 				writel_relaxed(patched, csram_base + dom_base +
 					       REG_FREQ_LUT + i * LUT_ROW_SIZE);
@@ -2281,7 +2365,7 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 	if (!cpu_oc_relift_active)
 		return;
 
-	/* Skip while system is suspended — cpufreq policies and
+	/* Skip while system is suspended - cpufreq policies and
 	 * freq_qos infrastructure may not be in a safe state.
 	 */
 	if (atomic_read(&kpm_suspended))
@@ -2394,7 +2478,7 @@ static void __nocfi cpu_oc_relift_work_fn(struct work_struct *work)
 	(void)any_lifted;
 
 	/* Safety net: event-driven sync handles transitions, this catches misses. */
-	cpu_reapply_volt_overrides_locked();
+	cpu_reapply_lut_overrides_locked();
 
 reschedule:
 	if (cpu_oc_relift_active)
@@ -2410,8 +2494,8 @@ reschedule:
  *
  * OPP entry layout (stride 24 bytes):
  *   u32 freq;     // KHz
- *   u32 volt;     // µV
- *   u32 vsram;    // µV
+ *   u32 volt;     // uV
+ *   u32 vsram;    // uV
  *   u32 posdiv;
  *   u32 vaging;
  *   u32 power;
@@ -2426,22 +2510,14 @@ reschedule:
  * Non-zero entries are direct-memory-patched into default + working tables
  * and kept alive by the GPU relift kthread.
  */
-static unsigned int gpu_volt_ov[GPU_MAX_OPPS];   /* override volt (10µV step), 0=off */
+static unsigned int gpu_volt_ov[GPU_MAX_OPPS];   /* override volt (10uV step), 0=off */
 static unsigned int gpu_vsram_ov[GPU_MAX_OPPS];  /* override vsram, 0=off */
 static int          gpu_volt_ov_count;            /* number of active overrides */
 
-/* Original default_opp_table values — saved on first override for clean restore */
+/* Original default_opp_table values - saved on first override for clean restore */
 static unsigned int gpu_orig_volt[GPU_MAX_OPPS];
 static unsigned int gpu_orig_vsram[GPU_MAX_OPPS];
 static bool         gpu_orig_saved;
-
-/* CPU per-LUT-entry voltage overrides.
- * Written directly to CSRAM, bypassing stock constraints.
- */
-static unsigned int cpu_volt_ov[NUM_CLUSTERS][LUT_MAX_ENTRIES]; /* µV, 0=off */
-static int          cpu_volt_ov_count;
-/* Original CSRAM LUT voltages for clean restore */
-static unsigned int cpu_orig_volt[NUM_CLUSTERS][LUT_MAX_ENTRIES];
 
 /* Configurable via module params */
 static unsigned int gpu_target_freq = 1400000;
@@ -2450,11 +2526,11 @@ MODULE_PARM_DESC(gpu_target_freq, "Target GPU freq in KHz (default 1400000 stock
 
 static unsigned int gpu_target_volt = 115040;
 module_param(gpu_target_volt, uint, 0644);
-MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt in 10µV steps (default 115040 = 1150.4mV; matches signed OPP[0]mV; matches signed OPP[0])");
+MODULE_PARM_DESC(gpu_target_volt, "Target GPU volt in 10uV steps (default 115040 = 1150.4mV; matches signed OPP[0]mV; matches signed OPP[0])");
 
 static unsigned int gpu_target_vsram = 95000;
 module_param(gpu_target_vsram, uint, 0644);
-MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram in 10µV steps (default 95000 = 950mV)");
+MODULE_PARM_DESC(gpu_target_vsram, "Target GPU vsram in 10uV steps (default 95000 = 950mV)");
 
 static bool gpu_auto_apply;
 module_param(gpu_auto_apply, bool, 0644);
@@ -2691,7 +2767,7 @@ static const struct kernel_param_ops gpu_pll_force_ops = {
 	.set = set_gpu_pll_force,
 };
 static int gpu_pll_force_dummy;
-module_param_cb(gpu_pll_force_khz, &gpu_pll_force_ops, &gpu_pll_force_dummy, 0220);
+module_param_cb(gpu_pll_force_khz, &gpu_pll_force_ops, &gpu_pll_force_dummy, 0644);
 MODULE_PARM_DESC(gpu_pll_force_khz, "Write KHz to directly program MFG PLL (must be <= gpu_target_freq unless gpu_pll_force_unsafe=1)");
 
 /*
@@ -2767,7 +2843,7 @@ static void __nocfi gpu_resolve_runtime_symbols(void)
     if (!fn_get_signed_table_wrap)
         fn_get_signed_table_wrap =
             (gpufreq_get_table_tgt_t)kln_func("gpufreq_get_signed_table");
-    /* Direct GPU freq override — bypasses GPUEB OPP table for above-stock OC */
+    /* Direct GPU freq override - bypasses GPUEB OPP table for above-stock OC */
     if (!fn_fix_custom_fv)
         fn_fix_custom_fv =
             (gpufreq_fix_custom_fv_t)kln_func("gpufreq_fix_custom_freq_volt");
@@ -2810,7 +2886,7 @@ static int gpu_patch_table_opp0(u32 *tbl, const char *name, int bit)
 }
 
 /*
- * gpu_oc_patch_wk_ss — attempt to patch working_table and signed_table.
+ * gpu_oc_patch_wk_ss - attempt to patch working_table and signed_table.
  * Caller MUST hold &lock.
  * Returns bitmask of new patches (bits 2/4).
  */
@@ -2930,7 +3006,7 @@ static void __nocfi gpu_oc_diagnostic(void)
  * Root cause: GPUEB firmware owns the shared_status/working_table in shared
  * memory and continuously overwrites OPP voltage fields (e.g. OPP[0].volt
  * reverts to 40500 from our target 105000).  The g_gpu_default_opp_table in
- * AP module .bss is also reverted — likely by a kernel path that synchronises
+ * AP module .bss is also reverted - likely by a kernel path that synchronises
  * from shared_status back to the default table.
  *
  * Fix: Kprobe on __gpufreq_generic_commit_gpu.  This is the main GPU DVFS
@@ -2957,7 +3033,7 @@ static int __nocfi gpu_commit_kp_pre(struct kprobe *p, struct pt_regs *regs)
 
 	/* Unconditionally re-patch default_opp_table[0].
 	 * GPUEB firmware continuously overwrites freq+volt+vsram in shared
-	 * memory, so we must force ALL three fields every commit — not just
+	 * memory, so we must force ALL three fields every commit - not just
 	 * volt/vsram.  The old "if (tbl[0] == tgt_freq)" guard caused the
 	 * kprobe to skip the patch entirely once GPUEB reverted freq.
 	 */
@@ -3052,7 +3128,7 @@ static int __nocfi gpu_oc_kthread_fn(void *data)
 		if (READ_ONCE(gpu_target_freq) == 0)
 			continue;
 
-		/* Skip while system is suspended — GPU (MFG domain) is
+		/* Skip while system is suspended - GPU (MFG domain) is
 		 * powered off, any MMIO/function-pointer access would
 		 * cause a bus hang and HWT reboot.
 		 */
@@ -3063,7 +3139,7 @@ static int __nocfi gpu_oc_kthread_fn(void *data)
 		gpu_oc_patched |= gpu_oc_patch_wk_ss();
 		gpu_resolve_runtime_symbols();
 		/* Check working_table bit only; signed_table may be NULL on
-		 * this SoC and that is expected — not a miss condition.
+		 * this SoC and that is expected - not a miss condition.
 		 */
 		now = gpu_oc_patched & 2;
 		mutex_unlock(&lock);
@@ -3076,7 +3152,7 @@ static int __nocfi gpu_oc_kthread_fn(void *data)
 		 * __gpufreq_generic_commit_gpu is NEVER called.
 		 *
 		 * For above-stock OC:
-		 *   DO NOT call fix_custom_freq_volt — it locks GPUEB at a
+		 *   DO NOT call fix_custom_freq_volt - it locks GPUEB at a
 		 *   fixed OPP, blocking thermal throttling.  Instead, let
 		 *   GPUEB manage DVFS normally.  The gpu_commit_kretp
 		 *   kretprobe reprograms PLL after each OPP[0] commit,
@@ -3189,14 +3265,14 @@ out:
 
 static const struct kernel_param_ops gpu_oc_ops = { .set = set_gpu_oc };
 static int gpu_oc_dummy;
-module_param_cb(gpu_oc_apply, &gpu_oc_ops, &gpu_oc_dummy, 0220);
+module_param_cb(gpu_oc_apply, &gpu_oc_ops, &gpu_oc_dummy, 0644);
 MODULE_PARM_DESC(gpu_oc_apply, "Write 1 to patch GPU OPP[0] in kernel memory");
 
 /* ─── GPU Per-OPP Voltage Override (direct memory, no driver validation) ── */
 /*
  * Input format: "idx:volt[:vsram] idx:volt[:vsram] ..."
  *   idx  = OPP index (0..GPU_MAX_OPPS-1)
- *   volt = voltage in 10µV steps (same unit as /proc/gpufreqv2 shows)
+ *   volt = voltage in 10uV steps (same unit as /proc/gpufreqv2 shows)
  *   vsram = optional, defaults to volt if omitted
  *
  * Example: "0 95000 95000 1 85000 85000" sets OPP[0] and OPP[1].
@@ -3394,7 +3470,7 @@ out_unlock:
 
 static const struct kernel_param_ops gpu_volt_ov_ops = { .set = set_gpu_volt_ov };
 static int gpu_volt_ov_dummy;
-module_param_cb(gpu_volt_override, &gpu_volt_ov_ops, &gpu_volt_ov_dummy, 0220);
+module_param_cb(gpu_volt_override, &gpu_volt_ov_ops, &gpu_volt_ov_dummy, 0644);
 MODULE_PARM_DESC(gpu_volt_override,
 		 "Per-OPP GPU voltage override: 'idx:volt[:vsram] ...' (direct memory)");
 
@@ -3403,7 +3479,7 @@ MODULE_PARM_DESC(gpu_volt_override,
  * Input format: "cluster:lut_idx:volt_uv cluster:lut_idx:volt_uv ..."
  *   cluster  = 0(L), 1(B), 2(P)
  *   lut_idx  = LUT entry index (0 = highest freq)
- *   volt_uv  = voltage in µV
+ *   volt_uv  = voltage in uV
  *
  * Write "clear" to remove all overrides.
  */
@@ -3510,7 +3586,7 @@ static int set_cpu_volt_ov(const char *val, const struct kernel_param *kp)
 		writel_relaxed(new_lut, csram_base + dom_base +
 			       REG_FREQ_LUT + idx * LUT_ROW_SIZE);
 
-		pr_info("KPM_OC: cpu_volt_ov c%u[%u]: %uµV->%uµV (0x%08x->0x%08x)\n",
+		pr_info("KPM_OC: cpu_volt_ov c%u[%u]: %uuV->%uuV (0x%08x->0x%08x)\n",
 			cl, idx, orig_volt_uv, volt_uv, orig_lut, new_lut);
 
 		/* Update OPP cache so get_opp_table reflects the change */
@@ -3550,9 +3626,194 @@ static int set_cpu_volt_ov(const char *val, const struct kernel_param *kp)
 
 static const struct kernel_param_ops cpu_volt_ov_ops = { .set = set_cpu_volt_ov };
 static int cpu_volt_ov_dummy;
-module_param_cb(cpu_volt_override, &cpu_volt_ov_ops, &cpu_volt_ov_dummy, 0220);
+module_param_cb(cpu_volt_override, &cpu_volt_ov_ops, &cpu_volt_ov_dummy, 0644);
 MODULE_PARM_DESC(cpu_volt_override,
 		 "Per-LUT CPU voltage override: 'cl:idx:volt_uv ...' (CSRAM direct)");
+
+/*
+ * Per-LUT CPU frequency override (below-top LUT slots only).
+ * Format: cluster:idx:freq_khz  (idx 0 = top, use cpu_oc_apply instead)
+ * Write "clear" to remove all frequency overrides.
+ */
+#define CPU_FREQ_OV_RESULT_SIZE 1024
+static char cpu_freq_ov_result[CPU_FREQ_OV_RESULT_SIZE];
+module_param_string(cpu_freq_ov_result, cpu_freq_ov_result,
+		    sizeof(cpu_freq_ov_result), 0444);
+MODULE_PARM_DESC(cpu_freq_ov_result, "Result of last CPU per-LUT frequency override");
+
+static int set_cpu_freq_ov(const char *val, const struct kernel_param *kp)
+{
+	char buf[1024];
+	char *p, *tok;
+	int pos = 0, count = 0;
+	bool touched[NUM_CLUSTERS] = { false };
+
+	if (!val || !*val)
+		return -EINVAL;
+	if (!csram_base) {
+		snprintf(cpu_freq_ov_result, CPU_FREQ_OV_RESULT_SIZE,
+			 "FAIL:csram_not_mapped");
+		return 0;
+	}
+
+	strscpy(buf, val, sizeof(buf));
+
+	if (strncmp(buf, "clear", 5) == 0) {
+		int c, i;
+
+		mutex_lock(&lock);
+		for (c = 0; c < NUM_CLUSTERS; c++) {
+			for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+				unsigned int dom_base;
+				unsigned int old_khz, orig_khz, orig_mhz;
+				u32 cur, restored;
+
+				if (!cpu_freq_ov[c][i])
+					continue;
+				dom_base = domain_offsets[c];
+				old_khz = cpu_freq_ov[c][i];
+				orig_khz = cpu_orig_freq_khz[c][i];
+				if (!orig_khz)
+					continue;
+				cur = readl_relaxed(csram_base + dom_base +
+						    REG_FREQ_LUT +
+						    i * LUT_ROW_SIZE);
+				orig_mhz = orig_khz / 1000;
+				restored = (cur & ~LUT_FREQ_MASK) |
+					   (orig_mhz & LUT_FREQ_MASK);
+				writel_relaxed(restored, csram_base + dom_base +
+					       REG_FREQ_LUT + i * LUT_ROW_SIZE);
+				cpu_sync_cpufreq_entry(c, old_khz, orig_khz);
+				if (opp_cache_valid && (int)i < opp_cache_count[c])
+					opp_cache[c][i].freq_khz = orig_khz;
+			}
+		}
+		wmb();
+		memset(cpu_freq_ov, 0, sizeof(cpu_freq_ov));
+		memset(cpu_orig_freq_khz, 0, sizeof(cpu_orig_freq_khz));
+		cpu_freq_ov_count = 0;
+		snprintf(cpu_freq_ov_result, CPU_FREQ_OV_RESULT_SIZE, "cleared");
+		mutex_unlock(&lock);
+		return 0;
+	}
+
+	mutex_lock(&lock);
+	memset(cpu_freq_ov_result, 0, sizeof(cpu_freq_ov_result));
+
+	p = buf;
+	while ((tok = strsep(&p, " \t\n")) != NULL) {
+		unsigned int cl, idx, freq_khz;
+		unsigned int dom_base, prev_khz, new_mhz;
+		u32 orig_lut, new_lut;
+
+		if (!*tok)
+			continue;
+
+		if (sscanf(tok, "%u:%u:%u", &cl, &idx, &freq_khz) != 3) {
+			pos += snprintf(cpu_freq_ov_result + pos,
+					CPU_FREQ_OV_RESULT_SIZE - pos,
+					"SKIP:parse(%s),", tok);
+			continue;
+		}
+		if (cl >= NUM_CLUSTERS) {
+			pos += snprintf(cpu_freq_ov_result + pos,
+					CPU_FREQ_OV_RESULT_SIZE - pos,
+					"SKIP:cl%u(OOB),", cl);
+			continue;
+		}
+		if (idx == 0 || idx >= LUT_MAX_ENTRIES) {
+			pos += snprintf(cpu_freq_ov_result + pos,
+					CPU_FREQ_OV_RESULT_SIZE - pos,
+					"SKIP:idx%u(use_oc),", idx);
+			continue;
+		}
+		if (freq_khz < 100000 || freq_khz > 5000000) {
+			pos += snprintf(cpu_freq_ov_result + pos,
+					CPU_FREQ_OV_RESULT_SIZE - pos,
+					"SKIP:freq%u(OOB),", freq_khz);
+			continue;
+		}
+
+		dom_base = domain_offsets[cl];
+		orig_lut = readl_relaxed(csram_base + dom_base +
+					 REG_FREQ_LUT + idx * LUT_ROW_SIZE);
+		if (!(orig_lut & LUT_FREQ_MASK)) {
+			pos += snprintf(cpu_freq_ov_result + pos,
+					CPU_FREQ_OV_RESULT_SIZE - pos,
+					"SKIP:empty[%u],", idx);
+			continue;
+		}
+
+		if (!cpu_orig_freq_khz[cl][idx]) {
+			unsigned int orig_mhz = orig_lut & LUT_FREQ_MASK;
+
+			cpu_orig_freq_khz[cl][idx] = orig_mhz * 1000;
+		}
+
+		prev_khz = cpu_freq_ov[cl][idx] ?
+			   cpu_freq_ov[cl][idx] : cpu_orig_freq_khz[cl][idx];
+		cpu_freq_ov[cl][idx] = freq_khz;
+		touched[cl] = true;
+
+		new_mhz = freq_khz / 1000;
+		new_lut = (orig_lut & ~LUT_FREQ_MASK) | (new_mhz & LUT_FREQ_MASK);
+		if (cpu_volt_ov[cl][idx])
+			new_lut = (new_lut & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+				  ((cpu_volt_ov[cl][idx] / 10) << 12);
+
+		writel_relaxed(new_lut, csram_base + dom_base +
+			       REG_FREQ_LUT + idx * LUT_ROW_SIZE);
+
+		cpu_sync_cpufreq_entry(cl, prev_khz, freq_khz);
+
+		if (opp_cache_valid && (int)idx < opp_cache_count[cl])
+			opp_cache[cl][idx].freq_khz = freq_khz;
+
+		count++;
+		pos += snprintf(cpu_freq_ov_result + pos,
+				CPU_FREQ_OV_RESULT_SIZE - pos,
+				"%s[%u]=%uKHz,",
+				cluster_names[cl], idx, freq_khz);
+
+		pr_info("KPM_OC: cpu_freq_ov c%u[%u]: %u->%uKHz (0x%08x->0x%08x)\n",
+			cl, idx, prev_khz, freq_khz, orig_lut, new_lut);
+	}
+	wmb();
+
+	{
+		int c, i, n = 0;
+
+		for (c = 0; c < NUM_CLUSTERS; c++) {
+			if (touched[c] && cpu_validate_lut_descending(c)) {
+				pos += snprintf(cpu_freq_ov_result + pos,
+						CPU_FREQ_OV_RESULT_SIZE - pos,
+						"WARN:%s_order,", cluster_names[c]);
+			}
+		}
+		for (c = 0; c < NUM_CLUSTERS; c++)
+			for (i = 0; i < LUT_MAX_ENTRIES; i++)
+				if (cpu_freq_ov[c][i])
+					n++;
+		cpu_freq_ov_count = n;
+	}
+
+	if (count > 0 && pos > 0 && cpu_freq_ov_result[pos - 1] == ',')
+		cpu_freq_ov_result[pos - 1] = '\0';
+	if (count == 0)
+		snprintf(cpu_freq_ov_result, CPU_FREQ_OV_RESULT_SIZE, "NOOP");
+
+	pr_info("KPM_OC: CPU freq override: %d entries applied, %d total active\n",
+		count, cpu_freq_ov_count);
+
+	mutex_unlock(&lock);
+	return 0;
+}
+
+static const struct kernel_param_ops cpu_freq_ov_ops = { .set = set_cpu_freq_ov };
+static int cpu_freq_ov_dummy;
+module_param_cb(cpu_freq_override, &cpu_freq_ov_ops, &cpu_freq_ov_dummy, 0644);
+MODULE_PARM_DESC(cpu_freq_override,
+		 "Per-LUT CPU frequency override: 'cl:idx:freq_khz ...' (LUT[1+] only)");
 
 /* ─── PM Suspend/Resume Notifier ────────────────────────────────────────── */
 
@@ -3581,6 +3842,25 @@ static void cpu_csram_restore_stock(void)
 				cpu_oc_orig_lut0[c] & LUT_FREQ_MASK);
 		}
 
+		/* Restore per-entry frequency overrides to stock */
+		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			if (cpu_freq_ov[c][i] && cpu_orig_freq_khz[c][i]) {
+				unsigned int dom_base = domain_offsets[c];
+				unsigned int old_khz = cpu_freq_ov[c][i];
+				unsigned int orig_khz = cpu_orig_freq_khz[c][i];
+				u32 cur = readl_relaxed(csram_base + dom_base +
+							REG_FREQ_LUT +
+							i * LUT_ROW_SIZE);
+				unsigned int orig_mhz = orig_khz / 1000;
+				u32 restored = (cur & ~LUT_FREQ_MASK) |
+					       (orig_mhz & LUT_FREQ_MASK);
+
+				writel_relaxed(restored, csram_base + dom_base +
+					       REG_FREQ_LUT + i * LUT_ROW_SIZE);
+				cpu_sync_cpufreq_entry(c, old_khz, orig_khz);
+			}
+		}
+
 		/* Restore per-entry voltage overrides to stock */
 		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
 			if (cpu_volt_ov[c][i] && cpu_orig_volt[c][i]) {
@@ -3599,7 +3879,7 @@ static void cpu_csram_restore_stock(void)
 
 /*
  * Re-apply OC'd CSRAM LUT[0] values after resume.
- * Only touches CSRAM — cpufreq policy is already configured.
+ * Only touches CSRAM - cpufreq policy is already configured.
  */
 static void cpu_csram_reapply_oc(void)
 {
@@ -3633,17 +3913,26 @@ static void cpu_csram_reapply_oc(void)
 				target_uv);
 		}
 
-		/* Re-apply per-entry voltage overrides */
+		/* Re-apply per-entry frequency + voltage overrides */
 		for (i = 0; i < LUT_MAX_ENTRIES; i++) {
+			unsigned int freq_khz = cpu_freq_ov[c][i];
 			unsigned int ov = cpu_volt_ov[c][i];
 			u32 cur, patched;
+			unsigned int f_mhz;
 
-			if (!ov)
+			if (!freq_khz && !ov)
 				continue;
 			cur = readl_relaxed(csram_base + dom_base +
 					    REG_FREQ_LUT + i * LUT_ROW_SIZE);
-			patched = (cur & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
-				  ((ov / 10) << 12);
+			patched = cur;
+			if (freq_khz) {
+				f_mhz = freq_khz / 1000;
+				patched = (patched & ~LUT_FREQ_MASK) |
+					  (f_mhz & LUT_FREQ_MASK);
+			}
+			if (ov)
+				patched = (patched & (LUT_GEAR_MASK | LUT_FREQ_MASK)) |
+					  ((ov / 10) << 12);
 			writel_relaxed(patched, csram_base + dom_base +
 				       REG_FREQ_LUT + i * LUT_ROW_SIZE);
 		}
@@ -3715,7 +4004,7 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 		 * frequencies during deep sleep (prevents SSPM WDT reset).
 		 */
 		cpu_csram_restore_stock();
-		pr_info("KPM_OC: suspend — CSRAM restored to stock, HW access paused\n");
+		pr_info("KPM_OC: suspend - CSRAM restored to stock, HW access paused\n");
 		break;
 	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
@@ -3743,7 +4032,7 @@ static int kpm_oc_pm_notify(struct notifier_block *nb,
 		if (cpu_oc_relift_active)
 			schedule_delayed_work(&cpu_oc_relift_dwork,
 					      msecs_to_jiffies(RELIFT_INTERVAL_MS));
-		pr_info("KPM_OC: resume — CSRAM OC re-applied, HW access resumed\n");
+		pr_info("KPM_OC: resume - CSRAM OC re-applied, HW access resumed\n");
 		break;
 	}
 
@@ -3780,7 +4069,7 @@ static struct notifier_block kpm_oc_pm_nb = {
  *      never completes, SSPM/MCUPM observes a heartbeat miss and asserts
  *      the silent HWT reset.
  *
- * Restoring CSRAM to stock LUT[0] before freeze is not sufficient — the
+ * Restoring CSRAM to stock LUT[0] before freeze is not sufficient - the
  * crash lives entirely inside the vendor noirq callback, not in any
  * voltage/frequency state we control.  The only reliable fix is to skip
  * the body of the offending callbacks; when they are bypassed the modem
@@ -3816,7 +4105,7 @@ MODULE_PARM_DESC(dpm_shield_enabled,
  * (e.g. "noirq suspend"), the callback function address, the return code,
  * and the elapsed time in microseconds.  The last unmatched "enter" line in
  * console-ramoops after a silent watchdog reset identifies the exact device
- * whose PM callback hung — the root cause we cannot otherwise observe because
+ * whose PM callback hung - the root cause we cannot otherwise observe because
  * vendor noirq callbacks typically do not print on entry and the ftrace
  * ring-buffer is volatile.
  *
@@ -3950,7 +4239,7 @@ static int __nocfi kpm_dpm_run_cb_shield(struct kprobe *p, struct pt_regs *regs)
  *
  * Paired with the entry tracer above.  Captures the return code of the
  * callback we logged at entry, so after a silent reset we can see which
- * enter line has no matching exit line — that is the hanging device.
+ * enter line has no matching exit line - that is the hanging device.
  *
  * The entry-side handler stashes the device name pointer and the callback
  * kind string so the exit line can print them even though the PM core has
@@ -4016,7 +4305,7 @@ static struct kretprobe kpm_dpm_run_krp = {
  *
  * The kretprobe on dpm_run_callback above captures suspend / suspend_late
  * phases but on this kernel build it does NOT fire during the suspend_noirq
- * phase — vendor code paths or interrupt-disabled timing cause that probe
+ * phase - vendor code paths or interrupt-disabled timing cause that probe
  * to miss the critical window where the hang actually happens.  To capture
  * every single device entry into the noirq phase we kprobe the PM core
  * iteration function __device_suspend_noirq directly; it is called once
@@ -4048,7 +4337,7 @@ static int __nocfi kpm_dev_susp_noirq_ent_krp(struct kretprobe_instance *ri,
 	ctx->drv = (dev && dev->driver && dev->driver->name)
 			? dev->driver->name : NULL;
 
-	/* Only log devices that have an actual driver — this filters the huge
+	/* Only log devices that have an actual driver - this filters the huge
 	 * amount of "drv=(none)" bookkeeping entries (memoryN, cpu, platform,
 	 * dramc-chX-topY, pwrap-partition-N, etc.) which have no callback and
 	 * would otherwise drown out the pm_print_times lines in the 256 KiB
@@ -4110,7 +4399,7 @@ static struct kretprobe kpm_dev_susp_noirq_krp = {
  *       arch_suspend_disable_irqs()
  *       s2idle_enter() / suspend_ops->enter() / psci_cpu_suspend_enter()
  *
- * Hook a small, high-signal kretprobe on each of these — the LAST
+ * Hook a small, high-signal kretprobe on each of these - the LAST
  * "KPMPHASE: enter <fn>" with no matching "KPMPHASE: exit <fn>" in ramoops
  * after a fresh watchdog reboot is the function holding the thread when
  * the CPU goes dark.  All handlers are guarded by kpm_suspend_trace_enabled
@@ -4269,7 +4558,7 @@ static int kpm_noirq_shield_register(void)
 	 * high-signal stages walked after dpm_suspend_noirq completes so we
 	 * can pinpoint which stage owns the hang window (the last "enter"
 	 * without a matching "exit" in ramoops is the culprit).  Failures to
-	 * register individual probes are non-fatal — some symbols (e.g.
+	 * register individual probes are non-fatal - some symbols (e.g.
 	 * s2idle_loop) are only present when suspend-to-idle is compiled in,
 	 * but they all exist on this kernel per kallsyms inspection.
 	 */
